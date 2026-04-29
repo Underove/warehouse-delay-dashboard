@@ -1,0 +1,22 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# data — 너무 크고 대회 라이선스 이슈
+data/
+*.csv
+
+# 학습된 모델 (별도 릴리스로 관리)
+models/*.pkl
+models/*.cbm
+models/*.txt
+models/*.json
+models/*.pt
+models/*.bin
+
+.DS_Store
+.env
+.env.local
