@@ -23,9 +23,9 @@ RISK_COLOR = {
 RISK_LABEL = {"normal": "정상", "warning": "경고", "critical": "임계"}
 SIGNAL_COLS = ("order_inflow_15m", "congestion_score", "robot_active", "pack_utilization")
 SIGNAL_LABEL = {
-    "order_inflow_15m": "주문 유입 (15m)",
-    "congestion_score": "혼잡도",
-    "robot_active": "로봇 가동",
+    "order_inflow_15m": "주문 유입 (15분)",
+    "congestion_score": "통로 혼잡도",
+    "robot_active": "AMR 가동",
     "pack_utilization": "패킹 가동률",
 }
 GAUGE_MAX = 40.0
@@ -54,12 +54,21 @@ PIPELINE_STAGES = [
         "risk_dir": +1,
     },
     {
+        "key": "charge",
+        "icon": "🔋",
+        "title": "충전·배차",
+        "desc": "AMR 배터리 관리 · 충전 큐",
+        "metric_col": "low_battery_ratio",
+        "metric_label": "저배터리 비율",
+        "risk_dir": +1,
+    },
+    {
         "key": "pick",
         "icon": "🤖",
-        "title": "로봇 피킹",
-        "desc": "AGV/AMR이 SKU를 가져옴",
+        "title": "AMR 피킹",
+        "desc": "자율이동로봇이 SKU를 가져옴",
         "metric_col": "robot_active",
-        "metric_label": "가동 로봇",
+        "metric_label": "가동 AMR",
         "risk_dir": +1,
     },
     {
@@ -105,15 +114,15 @@ RADAR_COLS = (
     "robot_active",
     "pack_utilization",
     "aisle_traffic_score",
-    "path_optimization_score",
+    "low_battery_ratio",
 )
 RADAR_LABEL = {
     "order_inflow_15m": "주문 유입",
     "congestion_score": "혼잡도",
-    "robot_active": "로봇 가동",
+    "robot_active": "AMR 가동",
     "pack_utilization": "패킹 가동률",
     "aisle_traffic_score": "통로 혼잡",
-    "path_optimization_score": "경로 최적성",
+    "low_battery_ratio": "저배터리 비율",
 }
 # +1: 높을수록 위험, -1: 낮을수록 위험
 RADAR_RISK_DIR = {
@@ -122,7 +131,7 @@ RADAR_RISK_DIR = {
     "robot_active": +1,
     "pack_utilization": +1,
     "aisle_traffic_score": +1,
-    "path_optimization_score": -1,
+    "low_battery_ratio": +1,
 }
 
 LAYOUT_META_PREFERRED = [
@@ -197,24 +206,45 @@ def main() -> None:
     layout_ids = sorted(test["layout_id"].astype(str).unique().tolist())
     default_layout = layout_ids[0]
 
-    # scenario별 (seq, preds) 캐시 — 슬라이더 드래그 시 25 prediction 재계산 방지
-    scenario_cache: dict[str, tuple[pd.DataFrame, list]] = {}
+    # layout → scenarios 매핑 미리 계산
+    layout_scenarios: dict[str, list[str]] = {}
+    for lid, group in test.groupby("layout_id"):
+        layout_scenarios[str(lid)] = group["scenario_id"].drop_duplicates().tolist()
 
-    def _scenario(layout_id_str: str) -> tuple[pd.DataFrame, list] | tuple[None, None]:
-        if layout_id_str in scenario_cache:
-            return scenario_cache[layout_id_str]
-        scenario = test[test["layout_id"].astype(str) == layout_id_str]
-        if scenario.empty:
+    # 신호 결측률 (모든 신호 + 파이프라인 신호)
+    signal_missing = {}
+    for c in list(SIGNAL_COLS) + list(RADAR_COLS) + [s["metric_col"] for s in PIPELINE_STAGES]:
+        if c in train.columns:
+            signal_missing[c] = float(train[c].isna().mean())
+
+    # scenario_id별 (seq, preds, summary) 캐시
+    scenario_cache: dict[str, tuple[pd.DataFrame, list]] = {}
+    scenario_summary_cache: dict[str, dict] = {}
+
+    def _scenario(scenario_id: str) -> tuple[pd.DataFrame, list] | tuple[None, None]:
+        if scenario_id in scenario_cache:
+            return scenario_cache[scenario_id]
+        sub = test[test["scenario_id"] == scenario_id].sort_values("ts_rank").reset_index(drop=True)
+        if sub.empty:
             return None, None
-        first_scenario_id = scenario["scenario_id"].iloc[0]
-        seq = (
-            scenario[scenario["scenario_id"] == first_scenario_id]
-            .sort_values("ts_rank")
-            .reset_index(drop=True)
-        )
-        preds = [predictor.predict_one(r) for _, r in seq.iterrows()]
-        scenario_cache[layout_id_str] = (seq, preds)
-        return seq, preds
+        preds = [predictor.predict_one(r) for _, r in sub.iterrows()]
+        scenario_cache[scenario_id] = (sub, preds)
+        return sub, preds
+
+    def _scenario_summary(scenario_id: str) -> dict:
+        if scenario_id in scenario_summary_cache:
+            return scenario_summary_cache[scenario_id]
+        _, preds = _scenario(scenario_id)
+        if not preds:
+            summary = {"critical": 0, "warning": 0, "max_value": 0.0, "avg": 0.0}
+        else:
+            crit = sum(1 for p in preds if p.risk == "critical")
+            warn = sum(1 for p in preds if p.risk == "warning")
+            max_v = max(p.value for p in preds)
+            avg = sum(p.value for p in preds) / len(preds)
+            summary = {"critical": crit, "warning": warn, "max_value": max_v, "avg": avg}
+        scenario_summary_cache[scenario_id] = summary
+        return summary
 
     app = Dash(__name__, assets_folder=str(ASSETS_DIR))
     app.title = "Warehouse Delay Dashboard"
@@ -280,12 +310,89 @@ def main() -> None:
         signal_ranges=signal_ranges,
     )
 
-    def _current_row(layout_id: str, ts: int) -> tuple[pd.Series | None, list, list]:
-        seq, preds = _scenario(str(layout_id))
+    def _current_row(scenario_id: str, ts: int) -> tuple[pd.Series | None, list, list]:
+        seq, preds = _scenario(scenario_id)
         if seq is None:
             return None, [], []
         ts = max(0, min(ts, len(seq) - 1))
         return seq.iloc[ts], preds, list(seq.index)
+
+    # Play/Pause 토글
+    @app.callback(
+        Output("play-tick", "disabled"),
+        Output("play-btn", "children"),
+        Output("play-btn", "className"),
+        Input("play-btn", "n_clicks"),
+        State("play-tick", "disabled"),
+        prevent_initial_call=True,
+    )
+    def toggle_play(_n, disabled):
+        if disabled is None:
+            disabled = True
+        new_disabled = not disabled
+        if new_disabled:
+            return True, "▶ 재생", "play-btn"
+        return False, "⏸ 정지", "play-btn play-btn--playing"
+
+    # 재생 속도 → Interval 간격
+    @app.callback(
+        Output("play-tick", "interval"),
+        Input("play-speed", "value"),
+    )
+    def set_play_speed(speed):
+        try:
+            mult = float(speed) if speed else 1.0
+        except (TypeError, ValueError):
+            mult = 1.0
+        return max(150, int(1000 / mult))
+
+    # Interval tick → ts-slider 한 칸 전진 (끝 도달 시 0으로)
+    @app.callback(
+        Output("ts-slider", "value", allow_duplicate=True),
+        Input("play-tick", "n_intervals"),
+        State("ts-slider", "value"),
+        prevent_initial_call=True,
+    )
+    def advance_ts(_n, current):
+        try:
+            cur = int(current) if current is not None else 0
+        except (TypeError, ValueError):
+            cur = 0
+        return (cur + 1) % SEQ_LEN
+
+    @app.callback(
+        Output("scenario-picker", "options"),
+        Output("scenario-picker", "value"),
+        Input("layout-picker", "value"),
+    )
+    def update_scenario_options(layout_id):
+        scenarios = layout_scenarios.get(str(layout_id), [])
+        n = len(scenarios)
+        # 시나리오별 위험도 요약 + 정렬 (critical 많은 순)
+        with_summary = []
+        for i, sid in enumerate(scenarios):
+            s = _scenario_summary(sid)
+            with_summary.append((i + 1, sid, s))
+        with_summary.sort(key=lambda x: (-x[2]["critical"], -x[2]["max_value"]))
+
+        options = []
+        for orig_idx, sid, s in with_summary:
+            crit = s["critical"]
+            warn = s["warning"]
+            if crit > 0:
+                icon = "🔴"
+                tag = f"임계 {crit}회"
+            elif warn > 0:
+                icon = "🟡"
+                tag = f"경고 {warn}회"
+            else:
+                icon = "🟢"
+                tag = "정상"
+            label = f"{icon} {tag} · 시나리오 {orig_idx}/{n} ({sid}) · 최대 {s['max_value']:.1f}분"
+            options.append({"label": label, "value": sid})
+
+        default = with_summary[0][1] if with_summary else None
+        return options, default
 
     @app.callback(
         Output("hero-card", "children"),
@@ -304,14 +411,18 @@ def main() -> None:
         Output("pattern-side", "children"),
         Output("pipeline-stages", "children"),
         Input("layout-picker", "value"),
+        Input("scenario-picker", "value"),
         Input("ts-slider", "value"),
     )
-    def update_main(layout_id: str, ts):
+    def update_main(layout_id: str, scenario_id, ts):
         try:
             ts = int(ts) if ts is not None else 0
         except (TypeError, ValueError):
             ts = 0
-        seq, preds = _scenario(str(layout_id))
+        if not scenario_id:
+            scenarios = layout_scenarios.get(str(layout_id), [])
+            scenario_id = scenarios[0] if scenarios else None
+        seq, preds = _scenario(str(scenario_id)) if scenario_id else (None, None)
         if seq is None:
             empty = go.Figure()
             return (
@@ -348,14 +459,15 @@ def main() -> None:
             lt = layout_row.get("layout_type")
             layout_type = LAYOUT_TYPE_KR.get(str(lt), str(lt)) if pd.notna(lt) else None
 
+        scenario_avg = sum(p.value for p in preds) / len(preds) if preds else 0
         return (
-            _hero(current, ts, len(seq), layout_type, current_row, radar_norm),
+            _hero(current, ts, len(seq), layout_type, current_row, radar_norm, scenario_avg),
             _gauge_figure(current.value, current.risk),
             _trend_figure(values, risks, ts, events_info),
             _contrib_figure(current.contributions or {}),
-            _signal_cards(current_row, signal_means, seq),
+            _signal_cards(current_row, signal_means, seq, signal_missing),
             _timeline_dots(risks, ts),
-            f"{_ts_to_clock(ts)} · {ts + 1}/{len(seq)} 시점",
+            f"{_ts_to_elapsed(ts)} · {ts + 1}/{len(seq)} 시점",
             f"status-pill status-pill--{current.risk}",
             _layout_meta(layout_info_idx, str(layout_id), layout_meta_cols),
             schematic,
@@ -366,19 +478,21 @@ def main() -> None:
             pipeline,
         )
 
-    # What-If: layout/ts/reset 트리거 → 4개 슬라이더를 현재 row 값으로 리셋
+    # What-If: scenario/ts/reset 트리거 → 4개 슬라이더를 현재 row 값으로 리셋
     @app.callback(
         [Output(f"whatif-{c}-slider", "value") for c in SIGNAL_COLS],
-        Input("layout-picker", "value"),
+        Input("scenario-picker", "value"),
         Input("ts-slider", "value"),
         Input("whatif-reset", "n_clicks"),
     )
-    def reset_whatif_sliders(layout_id, ts, _n_clicks):
+    def reset_whatif_sliders(scenario_id, ts, _n_clicks):
         try:
             ts = int(ts) if ts is not None else 0
         except (TypeError, ValueError):
             ts = 0
-        row, _preds, _ = _current_row(layout_id, ts)
+        if not scenario_id:
+            return [signal_ranges[c][0] for c in SIGNAL_COLS]
+        row, _preds, _ = _current_row(scenario_id, ts)
         if row is None:
             return [signal_ranges[c][0] for c in SIGNAL_COLS]
         out = []
@@ -398,16 +512,19 @@ def main() -> None:
         Output("whatif-comparison", "children"),
         Output("whatif-contrib-delta", "figure"),
         [Output(f"whatif-{c}-readout", "children") for c in SIGNAL_COLS],
-        Input("layout-picker", "value"),
+        Input("scenario-picker", "value"),
         Input("ts-slider", "value"),
         *whatif_inputs,
     )
-    def update_whatif(layout_id, ts, *slider_vals):
+    def update_whatif(scenario_id, ts, *slider_vals):
         try:
             ts = int(ts) if ts is not None else 0
         except (TypeError, ValueError):
             ts = 0
-        row, _preds, _ = _current_row(layout_id, ts)
+        if not scenario_id:
+            empty = go.Figure()
+            return html.Div("시나리오 미선택"), empty, *(["—"] * len(SIGNAL_COLS))
+        row, _preds, _ = _current_row(scenario_id, ts)
         if row is None:
             empty = go.Figure()
             return html.Div("데이터 없음"), empty, *(["—"] * len(SIGNAL_COLS))
@@ -457,12 +574,24 @@ def main() -> None:
 
 def _hero(pred, ts: int, total: int, layout_type: str | None = None,
           current_row: pd.Series | None = None,
-          radar_norm: dict | None = None) -> html.Div:
+          radar_norm: dict | None = None,
+          scenario_avg: float = 0.0) -> html.Div:
     color = RISK_COLOR[pred.risk]
     headroom = RISK_THRESHOLDS["critical"] - pred.value
     headroom_label = "여유" if headroom >= 0 else "초과"
     headroom_color = "#10b981" if headroom >= 0 else "#ef4444"
     narrative = _narrative_text(pred, layout_type, current_row, radar_norm)
+    # 시나리오 평균 대비
+    diff_from_avg = pred.value - scenario_avg
+    if abs(diff_from_avg) < 0.5:
+        avg_text = f"이 시나리오 평균 {scenario_avg:.1f}분 (현재 ≈ 평균)"
+        avg_color = "#94a3b8"
+    elif diff_from_avg > 0:
+        avg_text = f"이 시나리오 평균 {scenario_avg:.1f}분 (현재 +{diff_from_avg:.1f}분 높음)"
+        avg_color = RISK_COLOR["warning"]
+    else:
+        avg_text = f"이 시나리오 평균 {scenario_avg:.1f}분 (현재 {diff_from_avg:.1f}분 낮음)"
+        avg_color = RISK_COLOR["normal"]
     return html.Div(
         children=[
             html.Div(
@@ -505,14 +634,19 @@ def _hero(pred, ts: int, total: int, layout_type: str | None = None,
                     html.Div(
                         className="hero-card__meta-item",
                         children=[
-                            html.Span("시점", className="hero-card__meta-label"),
+                            html.Span("경과 시간", className="hero-card__meta-label"),
                             html.Span(
-                                f"{_ts_to_clock(ts)} ({ts * 15}분 경과)",
+                                f"{ts * 15}분 ({ts + 1}/{total} 시점)",
                                 className="hero-card__meta-value",
                             ),
                         ],
                     ),
                 ],
+            ),
+            html.Div(
+                className="hero-card__avg",
+                children=avg_text,
+                style={"color": avg_color},
             ),
         ]
     )
@@ -642,9 +776,13 @@ def _gauge_figure(value: float, risk: str) -> go.Figure:
 
 
 def _ts_to_clock(ts: int) -> str:
-    """timestep 0-24 → 'HH:MM' (15분 간격, 00:00 시작)."""
-    minutes = ts * 15
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    """timestep 0-24 → 경과 분 표기 (15분 간격). 절대 시각 아님."""
+    return f"{ts * 15}분"
+
+
+def _ts_to_elapsed(ts: int) -> str:
+    """timestep 0-24 → 'N분차' (시뮬레이션 시작부터 경과)."""
+    return f"{ts * 15}분차"
 
 
 def _detect_events(preds: list) -> dict:
@@ -697,17 +835,17 @@ def _alerts_strip(info: dict, current_ts: int, current_pred) -> html.Div:
         ),
         _alert_kpi(
             "첫 진입",
-            _ts_to_clock(info["first_critical"]) if info["first_critical"] is not None else "—",
+            _ts_to_elapsed(info["first_critical"]) if info["first_critical"] is not None else "—",
             "critical" if info["first_critical"] is not None else "normal",
         ),
         _alert_kpi(
             "최대 지연",
-            f"{info['max_value']:.1f}분 ({_ts_to_clock(info['max_ts'])})",
+            f"{info['max_value']:.1f}분 @ {_ts_to_elapsed(info['max_ts'])}",
             _classify_risk(info["max_value"]),
         ),
         _alert_kpi(
             "현재 시점",
-            f"{current_pred.value:.1f}분 ({_ts_to_clock(current_ts)})",
+            f"{current_pred.value:.1f}분 @ {_ts_to_elapsed(current_ts)}",
             current_pred.risk,
         ),
     ]
@@ -751,7 +889,7 @@ def _event_pill(ts: int, label: str, value: float, risk: str, arrow: str) -> htm
         style={"borderColor": color},
         children=[
             html.Span(arrow, className="event-pill__arrow", style={"color": color}),
-            html.Span(_ts_to_clock(ts), className="event-pill__ts"),
+            html.Span(_ts_to_elapsed(ts), className="event-pill__ts"),
             html.Span(label, className="event-pill__label", style={"color": color}),
             html.Span(f"{value:.1f}분", className="event-pill__value"),
         ],
@@ -776,11 +914,21 @@ def _trend_figure(values: list[float], risks: list[str], ts: int, events_info: d
         fill="tozeroy", fillcolor="rgba(99,102,241,0.18)",
         hoverinfo="skip", showlegend=False,
     ))
-    clocks = [_ts_to_clock(i) for i in x]
+
+    # 시나리오 평균 점선
+    scenario_mean = sum(values) / len(values) if values else 0
+    fig.add_hline(
+        y=scenario_mean,
+        line_dash="dot", line_color="#94a3b8", line_width=1.5,
+        annotation_text=f"시나리오 평균 {scenario_mean:.1f}분",
+        annotation_position="top right",
+        annotation_font={"color": "#94a3b8", "size": 10},
+    )
+    elapsed_labels = [_ts_to_elapsed(i) for i in x]
     fig.add_trace(go.Scatter(
         x=x, y=values, mode="markers",
         marker={"size": 9, "color": [RISK_COLOR[r] for r in risks], "line": {"width": 0}},
-        customdata=clocks,
+        customdata=elapsed_labels,
         hovertemplate="%{customdata}<br>예측=%{y:.2f}분<extra></extra>",
         showlegend=False,
     ))
@@ -788,7 +936,7 @@ def _trend_figure(values: list[float], risks: list[str], ts: int, events_info: d
         x=[ts], y=[values[ts]], mode="markers",
         marker={"size": 18, "color": RISK_COLOR[risks[ts]],
                 "line": {"color": "#f8fafc", "width": 2.5}},
-        hovertemplate=f"현재 시점 ({_ts_to_clock(ts)})<br>예측=%{{y:.2f}}분<extra></extra>",
+        hovertemplate=f"현재 시점 ({_ts_to_elapsed(ts)})<br>예측=%{{y:.2f}}분<extra></extra>",
         showlegend=False,
     ))
 
@@ -806,7 +954,7 @@ def _trend_figure(values: list[float], risks: list[str], ts: int, events_info: d
                 continue
             fig.add_annotation(
                 x=ev["ts"], y=ev["value"],
-                text=f"{text} {_ts_to_clock(ev['ts'])}",
+                text=f"{text} {_ts_to_elapsed(ev['ts'])}",
                 showarrow=True,
                 arrowhead=2, arrowsize=1, arrowwidth=1.5,
                 arrowcolor=color, ax=0, ay=ay,
@@ -821,10 +969,10 @@ def _trend_figure(values: list[float], risks: list[str], ts: int, events_info: d
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font={"color": "#e2e8f0"},
-        xaxis={"title": "시간 (15분 간격, 0~6시간)", "gridcolor": "#1e293b", "zeroline": False,
+        xaxis={"title": "시뮬레이션 경과 시간 (15분 간격)", "gridcolor": "#1e293b", "zeroline": False,
                "tickmode": "array",
                "tickvals": [0, 4, 8, 12, 16, 20, 24],
-               "ticktext": ["00:00", "01:00", "02:00", "03:00", "04:00", "05:00", "06:00"]},
+               "ticktext": ["0분", "60분", "120분", "180분", "240분", "300분", "360분"]},
         yaxis={"title": "분", "gridcolor": "#1e293b", "zeroline": False, "range": [0, y_max]},
         hoverlabel={"bgcolor": "#1e293b", "font": {"color": "#e2e8f0"}},
         transition={"duration": 280, "easing": "cubic-in-out"},
@@ -872,13 +1020,16 @@ def _contrib_figure(contrib: dict[str, float]) -> go.Figure:
     return fig
 
 
-def _signal_cards(row: pd.Series, means: dict[str, float], seq: pd.DataFrame) -> list:
+def _signal_cards(row: pd.Series, means: dict[str, float], seq: pd.DataFrame,
+                  missing: dict[str, float] | None = None) -> list:
     from dash import dcc
     cards = []
     ts_idx = int(row.get("ts_rank", 0)) if "ts_rank" in row else seq.index.get_loc(row.name)
     for col in SIGNAL_COLS:
+        miss_rate = (missing or {}).get(col, 0)
+        miss_text = f"데이터 결측 {miss_rate*100:.0f}%" if miss_rate > 0.05 else None
         if col not in row or pd.isna(row[col]):
-            cards.append(_signal_card(SIGNAL_LABEL.get(col, col), "—", "결측", "#64748b", None))
+            cards.append(_signal_card(SIGNAL_LABEL.get(col, col), "—", "결측", "#64748b", None, miss_text))
             continue
         val = float(row[col])
         mean = means.get(col)
@@ -892,11 +1043,14 @@ def _signal_cards(row: pd.Series, means: dict[str, float], seq: pd.DataFrame) ->
             delta, delta_color = "—", "#94a3b8"
         spark_values = seq[col].astype(float).tolist() if col in seq.columns else None
         spark_fig = _sparkline_figure(spark_values, ts_idx, delta_color) if spark_values else None
-        cards.append(_signal_card(SIGNAL_LABEL.get(col, col), f"{val:.2f}", delta, delta_color, spark_fig))
+        cards.append(_signal_card(
+            SIGNAL_LABEL.get(col, col), f"{val:.2f}", delta, delta_color, spark_fig, miss_text
+        ))
     return cards
 
 
-def _signal_card(title: str, value: str, delta: str, delta_color: str, spark_fig) -> html.Div:
+def _signal_card(title: str, value: str, delta: str, delta_color: str,
+                 spark_fig, miss_text: str | None = None) -> html.Div:
     from dash import dcc
     children = [
         html.Span(title, className="signal-card__title"),
@@ -912,6 +1066,8 @@ def _signal_card(title: str, value: str, delta: str, delta_color: str, spark_fig
                 style={"height": "32px"},
             ),
         ))
+    if miss_text:
+        children.append(html.Span(miss_text, className="signal-card__missing"))
     return html.Div(className="signal-card", children=children)
 
 
@@ -1114,10 +1270,11 @@ def _signal_action(col: str, signed_z: float) -> str:
         return "정상 범위 — 모니터링만"
     rules = {
         "order_inflow_15m": "주문 라우팅 일시 분산 + 핫존 작업자 1명 증원",
-        "congestion_score": "AGV 우회 경로 활성화 + 일방통행 임시 해제",
-        "robot_active": "유휴 로봇 투입 + 충전 큐 우선순위 재조정",
+        "congestion_score": "AMR 우회 경로 활성화 + 일방통행 임시 해제",
+        "robot_active": "유휴 AMR 투입 + 충전 큐 우선순위 재조정",
         "pack_utilization": "패킹 스테이션 추가 개방 + 출고 대기 라인 정리",
         "aisle_traffic_score": "통로 정체 — 작업자 동선 우회 안내",
+        "low_battery_ratio": "충전소 가용성 점검 + 배터리 저효율 AMR 우선 교체",
         "path_optimization_score": "경로 재최적화 호출 — WMS 설정 점검",
     }
     return rules.get(col, "운영 매니저 호출 — 현장 점검")
@@ -1324,7 +1481,7 @@ def _timeline_dots(risks: list[str], ts: int):
         dots.append(html.Span(
             className=cls,
             style={"backgroundColor": RISK_COLOR[r]},
-            title=f"{_ts_to_clock(i)} · {RISK_LABEL[r]}",
+            title=f"{_ts_to_elapsed(i)} · {RISK_LABEL[r]}",
         ))
     return dots
 

@@ -12,9 +12,9 @@ HIDE_TOOLTIP = {
 }
 
 SIGNAL_LABEL = {
-    "order_inflow_15m": "주문 유입 (15m)",
-    "congestion_score": "혼잡도",
-    "robot_active": "로봇 가동",
+    "order_inflow_15m": "주문 유입 (15분)",
+    "congestion_score": "통로 혼잡도",
+    "robot_active": "AMR 가동",
     "pack_utilization": "패킹 가동률",
 }
 
@@ -36,7 +36,7 @@ def build_layout(
                         children=[
                             html.H1("Warehouse Delay Dashboard"),
                             html.Span(
-                                "30분 후 평균 출고 지연 예측 · 예측 → 진단 → 시뮬레이션을 한 화면에",
+                                "AMR 기반 스마트 창고 30분 후 출고 지연 예측 · 예측 → 진단 → 시뮬레이션 한 화면에",
                                 className="app-header__subtitle",
                             ),
                         ],
@@ -76,14 +76,29 @@ def build_layout(
                 className="controls",
                 children=[
                     html.Div(
-                        className="controls__group",
+                        className="controls__group controls__group--stacked",
                         children=[
-                            html.Label("Layout"),
-                            dbc.Select(
-                                id="layout-picker",
-                                options=[{"label": lid, "value": lid} for lid in layout_ids],
-                                value=default_layout,
-                                className="dark-select",
+                            html.Div(
+                                children=[
+                                    html.Label("Layout (창고 레이아웃)"),
+                                    dbc.Select(
+                                        id="layout-picker",
+                                        options=[{"label": lid, "value": lid} for lid in layout_ids],
+                                        value=default_layout,
+                                        className="dark-select",
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                children=[
+                                    html.Label("Scenario (시뮬레이션 #)"),
+                                    dbc.Select(
+                                        id="scenario-picker",
+                                        options=[],
+                                        value=None,
+                                        className="dark-select",
+                                    ),
+                                ],
                             ),
                         ],
                     ),
@@ -96,7 +111,35 @@ def build_layout(
                                     html.Label(
                                         "시점 (15분 간격 · 한 시나리오 = 6시간 시뮬레이션)"
                                     ),
-                                    html.Span(id="ts-readout", className="ts-readout"),
+                                    html.Div(
+                                        className="play-control",
+                                        children=[
+                                            html.Button(
+                                                "▶ 재생",
+                                                id="play-btn",
+                                                className="play-btn",
+                                                n_clicks=0,
+                                            ),
+                                            dbc.Select(
+                                                id="play-speed",
+                                                options=[
+                                                    {"label": "0.5×", "value": "0.5"},
+                                                    {"label": "1×", "value": "1"},
+                                                    {"label": "2×", "value": "2"},
+                                                    {"label": "4×", "value": "4"},
+                                                ],
+                                                value="1",
+                                                className="dark-select play-speed",
+                                            ),
+                                            html.Span(id="ts-readout", className="ts-readout"),
+                                        ],
+                                    ),
+                                    dcc.Interval(
+                                        id="play-tick",
+                                        interval=1000,
+                                        disabled=True,
+                                        n_intervals=0,
+                                    ),
                                 ],
                             ),
                             dcc.Input(
@@ -111,8 +154,8 @@ def build_layout(
                             html.Div(
                                 className="time-bounds",
                                 children=[
-                                    html.Span("00:00 (시작)", className="time-bounds__label"),
-                                    html.Span("06:00 (종료)", className="time-bounds__label"),
+                                    html.Span("0분 (시뮬레이션 시작)", className="time-bounds__label"),
+                                    html.Span("360분 (6시간 후)", className="time-bounds__label"),
                                 ],
                             ),
                             html.Div(
@@ -139,7 +182,13 @@ def build_layout(
                     _section_head(
                         "1",
                         "스마트 창고 물류 흐름",
-                        "주문 유입부터 출고까지 5단계 · 단계 색깔 = 현재 위험 등급",
+                        "주문 유입부터 출고까지 6단계 · 단계 색깔 = 현재 위험 등급",
+                        help_text=(
+                            "AMR 기반 창고 운영 흐름을 6단계로 표현한 다이어그램. "
+                            "각 카드는 그 단계의 핵심 신호(예: 충전·배차→저배터리 비율)와 "
+                            "train 평균 대비 편차를 보여줍니다. "
+                            "빨간 카드 = 임계 단계, 주황 = 경고."
+                        ),
                     ),
                     html.Div(id="pipeline-stages", className="pipeline-stages"),
                 ],
@@ -158,10 +207,13 @@ def build_layout(
                             html.Div(id="hero-card", className="hero-card"),
                             html.Div(
                                 className="gauge-card",
-                                children=dcc.Graph(
-                                    id="gauge-chart",
-                                    config={"displayModeBar": False},
-                                    style={"height": "260px"},
+                                children=dcc.Loading(
+                                    type="dot", color="#818cf8",
+                                    children=dcc.Graph(
+                                        id="gauge-chart",
+                                        config={"displayModeBar": False},
+                                        style={"height": "260px"},
+                                    ),
                                 ),
                             ),
                         ],
@@ -177,10 +229,13 @@ def build_layout(
                         "6시간 시뮬레이션 동안 지연 변화 · 임계 진입/회복 자동 표시 · 흰 테두리 점 = 현재 시점",
                     ),
                     html.Div(id="alerts-strip", className="alerts-strip"),
-                    dcc.Graph(
-                        id="trend-chart",
-                        config={"displayModeBar": False},
-                        style={"height": "340px"},
+                    dcc.Loading(
+                        type="dot", color="#818cf8",
+                        children=dcc.Graph(
+                            id="trend-chart",
+                            config={"displayModeBar": False},
+                            style={"height": "340px"},
+                        ),
                     ),
                 ],
             ),
@@ -242,6 +297,12 @@ def build_layout(
                         "5",
                         "운영 패턴 진단",
                         "보라가 회색(평균) 밖으로 튀어나간 축이 위험 신호 · 빨간 꼭짓점은 평균보다 +25↑",
+                        help_text=(
+                            "Radar 차트: 핵심 신호 6개를 축으로 두고, "
+                            "현재 시점(보라)을 train 전체 평균(회색 점선)과 겹쳐 그림. "
+                            "축은 train의 1~99% 분위로 0~100 정규화. "
+                            "보라가 회색을 크게 벗어나면 그 신호가 정상에서 멀어진 상태."
+                        ),
                     ),
                     html.Div(
                         className="diagnostic-grid",
@@ -278,6 +339,11 @@ def build_layout(
                         "6",
                         "시간대별 패턴",
                         "요일 × 시간대 평균 지연 (train 전체) · 흰 테두리 셀 = 현재 시점의 요일·시간대",
+                        help_text=(
+                            "Heatmap 7요일 × 24시간. 각 셀 = train 전체에서 그 요일·시간 평균 지연. "
+                            "어두운 색 = 정상, 빨간 색 = 위험 시간대. "
+                            "흰 테두리 셀이 지금 분석 중인 시나리오의 요일·시간."
+                        ),
                     ),
                     html.Div(
                         className="pattern-grid",
@@ -305,6 +371,11 @@ def build_layout(
                         "7",
                         "What-If 시뮬레이션",
                         "왼쪽 슬라이더로 신호를 조정하면 오른쪽에 즉시 재예측 결과가 나타납니다",
+                        help_text=(
+                            "운영 의사결정 시뮬레이터: 4개 핵심 신호를 슬라이더로 바꾼 가상 상황의 "
+                            "예측을 현재와 비교. 위험도 전환(경고→임계 등)도 자동 표시. "
+                            "현재 시점으로 리셋 버튼으로 baseline 복귀."
+                        ),
                     ),
                     html.Div(
                         className="whatif-grid",
@@ -370,14 +441,21 @@ def _risk_chip(label: str, range_text: str, kind: str) -> html.Div:
     )
 
 
-def _section_head(num: str, title: str, hint: str) -> html.Div:
+def _section_head(num: str, title: str, hint: str, help_text: str | None = None) -> html.Div:
+    children = [
+        html.Span(num, className="section-header__num"),
+        html.H2(title, className="section-header__title"),
+        html.Span(hint, className="section-header__hint"),
+    ]
+    if help_text:
+        children.append(html.Span(
+            "ⓘ",
+            className="section-header__help",
+            title=help_text,
+        ))
     return html.Div(
         className="section-header section-header--numbered",
-        children=[
-            html.Span(num, className="section-header__num"),
-            html.H2(title, className="section-header__title"),
-            html.Span(hint, className="section-header__hint"),
-        ],
+        children=children,
     )
 
 
