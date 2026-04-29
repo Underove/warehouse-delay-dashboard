@@ -7,10 +7,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, html
+from dash import ALL, Dash, Input, Output, State, ctx, html, no_update
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from config import ASSETS_DIR, RISK_THRESHOLDS, SEQ_LEN
+from config import ASSETS_DIR, RISK_THRESHOLDS, SEQ_LEN, TARGET
 from src.components.layout import build_layout
 from src.data_loader import load_layout, load_test, load_train
 from src.inference import _classify_risk, load_predictor
@@ -32,10 +32,71 @@ GAUGE_MAX = 40.0
 
 
 def _prepare_test(test: pd.DataFrame) -> pd.DataFrame:
-    if "scenario_id" in test.columns and "ts_rank" not in test.columns:
-        test = test.copy()
+    """ID 기준 정렬(시간 순서) 후 scenario별 ts_rank 부여 (15분 간격, 25 timestep)."""
+    if "scenario_id" not in test.columns:
+        return test
+    test = test.copy()
+    if "ID" in test.columns:
+        test = test.sort_values("ID").reset_index(drop=True)
+    if "ts_rank" not in test.columns:
         test["ts_rank"] = test.groupby("scenario_id").cumcount()
     return test
+
+
+PIPELINE_STAGES = [
+    {
+        "key": "inbound",
+        "icon": "📥",
+        "title": "주문 유입",
+        "desc": "출고 주문이 시스템에 들어옴",
+        "metric_col": "order_inflow_15m",
+        "metric_label": "주문 (15분)",
+        "risk_dir": +1,
+    },
+    {
+        "key": "pick",
+        "icon": "🤖",
+        "title": "로봇 피킹",
+        "desc": "AGV/AMR이 SKU를 가져옴",
+        "metric_col": "robot_active",
+        "metric_label": "가동 로봇",
+        "risk_dir": +1,
+    },
+    {
+        "key": "aisle",
+        "icon": "🚥",
+        "title": "통로 이동",
+        "desc": "통로 혼잡 · 충돌 · 우회",
+        "metric_col": "congestion_score",
+        "metric_label": "혼잡도",
+        "risk_dir": +1,
+    },
+    {
+        "key": "pack",
+        "icon": "📦",
+        "title": "패킹",
+        "desc": "포장 · 라벨링 · 검수",
+        "metric_col": "pack_utilization",
+        "metric_label": "패킹 가동률",
+        "risk_dir": +1,
+    },
+    {
+        "key": "outbound",
+        "icon": "🚚",
+        "title": "출고",
+        "desc": "트럭 적재 · 도크 대기",
+        "metric_col": "outbound_truck_wait_min",
+        "metric_label": "도크 대기 (분)",
+        "risk_dir": +1,
+    },
+]
+
+LAYOUT_TYPE_KR = {
+    "narrow": "좁은 통로형",
+    "grid": "격자형",
+    "hybrid": "혼합형",
+    "hub_spoke": "허브-스포크형",
+}
 
 
 RADAR_COLS = (
@@ -96,6 +157,31 @@ def main() -> None:
             mean = float(train[c].mean(skipna=True))
             std = float(train[c].std(skipna=True))
             radar_norm[c] = {"p1": p1, "p99": p99, "mean": mean, "std": std or 1.0}
+
+    # 파이프라인 단계별 train 통계 (mean, std)
+    pipeline_stats = {}
+    for stage in PIPELINE_STAGES:
+        c = stage["metric_col"]
+        if c in train.columns:
+            m = float(train[c].mean(skipna=True))
+            s = float(train[c].std(skipna=True))
+            pipeline_stats[c] = {"mean": m, "std": s or 1.0}
+
+    # 시간대 패턴 (Phase 5): 요일 × 시간대 평균 지연
+    if "day_of_week" in train.columns and "shift_hour" in train.columns:
+        pat = (
+            train.dropna(subset=["day_of_week", "shift_hour"])
+            .groupby(["day_of_week", "shift_hour"])[TARGET]
+            .mean()
+            .unstack()
+            .sort_index()
+            .reindex(columns=range(24))
+        )
+        pattern_pivot = pat
+        pattern_overall_mean = float(train[TARGET].mean())
+    else:
+        pattern_pivot = None
+        pattern_overall_mean = float(train[TARGET].mean())
 
     layout_meta_cols = [(c, label) for c, label in LAYOUT_META_PREFERRED if c in layout_info.columns]
     if not layout_meta_cols:
@@ -213,6 +299,10 @@ def main() -> None:
         Output("layout-meta", "children"),
         Output("schematic-chart", "figure"),
         Output("bottleneck-list", "children"),
+        Output("alerts-strip", "children"),
+        Output("pattern-chart", "figure"),
+        Output("pattern-side", "children"),
+        Output("pipeline-stages", "children"),
         Input("layout-picker", "value"),
         Input("ts-slider", "value"),
     )
@@ -226,7 +316,8 @@ def main() -> None:
             empty = go.Figure()
             return (
                 html.Div("데이터 없음"), empty, empty, empty, [], [],
-                f"0/{SEQ_LEN}", "status-pill status-pill--normal", [], empty, [],
+                f"0/{SEQ_LEN}", "status-pill status-pill--normal", [], empty, [], [],
+                empty, [], [],
             )
         ts = max(0, min(ts, len(seq) - 1))
         values = [p.value for p in preds]
@@ -241,19 +332,38 @@ def main() -> None:
             layout_row = layout_row.iloc[0]
         schematic = _radar_figure(current_row, radar_norm)
         bottlenecks = _top_risk_signals(current_row, radar_norm)
+        events_info = _detect_events(preds)
+        cur_dow = current_row.get("day_of_week")
+        cur_hour = current_row.get("shift_hour")
+        cur_dow = int(cur_dow) if pd.notna(cur_dow) else None
+        cur_hour = int(cur_hour) if pd.notna(cur_hour) else None
+        pattern_fig = _pattern_figure(pattern_pivot, cur_dow, cur_hour)
+        pattern_side_card = _pattern_side(
+            pattern_pivot, pattern_overall_mean, cur_dow, cur_hour, current.value
+        )
+        pipeline = _pipeline_stages(current_row, pipeline_stats)
+
+        layout_type = None
+        if layout_row is not None and "layout_type" in layout_row.index:
+            lt = layout_row.get("layout_type")
+            layout_type = LAYOUT_TYPE_KR.get(str(lt), str(lt)) if pd.notna(lt) else None
 
         return (
-            _hero(current, ts, len(seq)),
+            _hero(current, ts, len(seq), layout_type, current_row, radar_norm),
             _gauge_figure(current.value, current.risk),
-            _trend_figure(values, risks, ts),
+            _trend_figure(values, risks, ts, events_info),
             _contrib_figure(current.contributions or {}),
             _signal_cards(current_row, signal_means, seq),
             _timeline_dots(risks, ts),
-            f"{ts + 1} / {len(seq)}",
+            f"{_ts_to_clock(ts)} · {ts + 1}/{len(seq)} 시점",
             f"status-pill status-pill--{current.risk}",
             _layout_meta(layout_info_idx, str(layout_id), layout_meta_cols),
             schematic,
             bottlenecks,
+            _alerts_strip(events_info, ts, current),
+            pattern_fig,
+            pattern_side_card,
+            pipeline,
         )
 
     # What-If: layout/ts/reset 트리거 → 4개 슬라이더를 현재 row 값으로 리셋
@@ -345,13 +455,21 @@ def main() -> None:
 
 # -- 차트/카드 빌더 ---------------------------------------------------------
 
-def _hero(pred, ts: int, total: int) -> html.Div:
+def _hero(pred, ts: int, total: int, layout_type: str | None = None,
+          current_row: pd.Series | None = None,
+          radar_norm: dict | None = None) -> html.Div:
     color = RISK_COLOR[pred.risk]
     headroom = RISK_THRESHOLDS["critical"] - pred.value
     headroom_label = "여유" if headroom >= 0 else "초과"
     headroom_color = "#10b981" if headroom >= 0 else "#ef4444"
+    narrative = _narrative_text(pred, layout_type, current_row, radar_norm)
     return html.Div(
         children=[
+            html.Div(
+                className="hero-card__narrative",
+                style={"borderLeftColor": color},
+                children=narrative,
+            ),
             html.Div(
                 className="hero-card__top",
                 children=[
@@ -387,13 +505,101 @@ def _hero(pred, ts: int, total: int) -> html.Div:
                     html.Div(
                         className="hero-card__meta-item",
                         children=[
-                            html.Span("진행 시점", className="hero-card__meta-label"),
-                            html.Span(f"{ts + 1} / {total}", className="hero-card__meta-value"),
+                            html.Span("시점", className="hero-card__meta-label"),
+                            html.Span(
+                                f"{_ts_to_clock(ts)} ({ts * 15}분 경과)",
+                                className="hero-card__meta-value",
+                            ),
                         ],
                     ),
                 ],
             ),
         ]
+    )
+
+
+def _narrative_text(pred, layout_type: str | None,
+                    current_row: pd.Series | None,
+                    radar_norm: dict | None) -> str:
+    risk_text = {"normal": "정상", "warning": "경고", "critical": "임계"}[pred.risk]
+    base = (
+        f"{layout_type + ' 창고' if layout_type else '이 창고'} · "
+        f"30분 후 {pred.value:.1f}분 지연 예상 ({risk_text})"
+    )
+    if current_row is None or radar_norm is None:
+        return base + "."
+    # 위험 방향 z-score top
+    deviations = []
+    for c in RADAR_COLS:
+        if c not in radar_norm:
+            continue
+        v = current_row.get(c)
+        if v is None or pd.isna(v):
+            continue
+        z = (float(v) - radar_norm[c]["mean"]) / radar_norm[c]["std"]
+        deviations.append((c, z * RADAR_RISK_DIR.get(c, 1)))
+    if not deviations:
+        return base + "."
+    deviations.sort(key=lambda x: x[1], reverse=True)
+    top_col, top_z = deviations[0]
+    if top_z >= 0.5:
+        return f"{base}. 가장 큰 원인: {RADAR_LABEL[top_col]}이(가) 평균보다 +{top_z:.1f}σ 높음."
+    return f"{base}. 모든 신호가 평균 범위 내 — 정상 운영 중."
+
+
+def _pipeline_stages(row: pd.Series, stats: dict) -> list:
+    cards = []
+    for i, stage in enumerate(PIPELINE_STAGES):
+        col = stage["metric_col"]
+        v = row.get(col) if col in row else None
+        if v is None or pd.isna(v) or col not in stats:
+            risk = "normal"
+            value_text = "—"
+            delta_text = "데이터 없음"
+        else:
+            v = float(v)
+            s = stats[col]
+            z = (v - s["mean"]) / s["std"]
+            signed_z = z * stage.get("risk_dir", 1)
+            risk = (
+                "critical" if signed_z >= 1.5 else
+                "warning" if signed_z >= 0.5 else
+                "normal"
+            )
+            value_text = f"{v:.1f}"
+            sign = "+" if signed_z >= 0 else ""
+            delta_text = f"{sign}{signed_z:.1f}σ vs 평균"
+        cards.append(_pipeline_card(stage, value_text, delta_text, risk))
+        if i < len(PIPELINE_STAGES) - 1:
+            cards.append(html.Div("→", className="pipeline-arrow"))
+    return cards
+
+
+def _pipeline_card(stage: dict, value_text: str, delta_text: str, risk: str) -> html.Div:
+    color = RISK_COLOR[risk]
+    return html.Div(
+        className=f"pipeline-card pipeline-card--{risk}",
+        style={"borderColor": color},
+        children=[
+            html.Div(
+                className="pipeline-card__head",
+                children=[
+                    html.Span(stage["icon"], className="pipeline-card__icon"),
+                    html.Span(stage["title"], className="pipeline-card__title"),
+                ],
+            ),
+            html.Span(stage["desc"], className="pipeline-card__desc"),
+            html.Div(
+                className="pipeline-card__metric",
+                children=[
+                    html.Span(value_text, className="pipeline-card__value",
+                              style={"color": color}),
+                    html.Span(stage["metric_label"], className="pipeline-card__metric-label"),
+                ],
+            ),
+            html.Span(delta_text, className="pipeline-card__delta",
+                      style={"color": color}),
+        ],
     )
 
 
@@ -435,7 +641,124 @@ def _gauge_figure(value: float, risk: str) -> go.Figure:
     return fig
 
 
-def _trend_figure(values: list[float], risks: list[str], ts: int) -> go.Figure:
+def _ts_to_clock(ts: int) -> str:
+    """timestep 0-24 → 'HH:MM' (15분 간격, 00:00 시작)."""
+    minutes = ts * 15
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _detect_events(preds: list) -> dict:
+    """6시간 시뮬레이션 내 risk 전환 이벤트 + 요약."""
+    events = []
+    prev = "normal"
+    max_value = -1.0
+    max_ts = 0
+    first_critical = None
+    critical_count = 0
+    warning_count = 0
+
+    for i, p in enumerate(preds):
+        if p.value > max_value:
+            max_value = p.value
+            max_ts = i
+        if p.risk == "critical":
+            critical_count += 1
+            if first_critical is None:
+                first_critical = i
+        if p.risk == "warning":
+            warning_count += 1
+
+        if p.risk == "critical" and prev != "critical":
+            events.append({"ts": i, "kind": "enter_critical", "value": p.value})
+        elif prev == "critical" and p.risk != "critical":
+            events.append({"ts": i, "kind": "exit_critical", "value": p.value, "to": p.risk})
+        elif p.risk == "warning" and prev == "normal":
+            events.append({"ts": i, "kind": "enter_warning", "value": p.value})
+        prev = p.risk
+
+    return {
+        "events": events,
+        "critical_count": critical_count,
+        "warning_count": warning_count,
+        "first_critical": first_critical,
+        "max_value": max_value,
+        "max_ts": max_ts,
+        "any_critical": critical_count > 0,
+        "total": len(preds),
+    }
+
+
+def _alerts_strip(info: dict, current_ts: int, current_pred) -> html.Div:
+    summary_items = [
+        _alert_kpi(
+            "임계 시점",
+            f"{info['critical_count']} / {info['total']}",
+            "critical" if info["any_critical"] else "normal",
+        ),
+        _alert_kpi(
+            "첫 진입",
+            _ts_to_clock(info["first_critical"]) if info["first_critical"] is not None else "—",
+            "critical" if info["first_critical"] is not None else "normal",
+        ),
+        _alert_kpi(
+            "최대 지연",
+            f"{info['max_value']:.1f}분 ({_ts_to_clock(info['max_ts'])})",
+            _classify_risk(info["max_value"]),
+        ),
+        _alert_kpi(
+            "현재 시점",
+            f"{current_pred.value:.1f}분 ({_ts_to_clock(current_ts)})",
+            current_pred.risk,
+        ),
+    ]
+
+    timeline_items = []
+    for ev in info["events"][:4]:
+        if ev["kind"] == "enter_critical":
+            timeline_items.append(_event_pill(ev["ts"], "임계 진입", ev["value"], "critical", "▲"))
+        elif ev["kind"] == "exit_critical":
+            timeline_items.append(_event_pill(ev["ts"], "정상 회복", ev["value"], "normal", "▼"))
+        elif ev["kind"] == "enter_warning":
+            timeline_items.append(_event_pill(ev["ts"], "경고 진입", ev["value"], "warning", "▲"))
+    if not timeline_items:
+        timeline_items = [html.Span(
+            "이벤트 없음 — 6시간 동안 정상 범위", className="alerts-empty"
+        )]
+
+    return html.Div(
+        className="alerts-strip__inner",
+        children=[
+            html.Div(className="alerts-summary", children=summary_items),
+            html.Div(className="alerts-timeline", children=timeline_items),
+        ],
+    )
+
+
+def _alert_kpi(label: str, value: str, risk: str) -> html.Div:
+    return html.Div(
+        className="alert-kpi",
+        children=[
+            html.Span(label, className="alert-kpi__label"),
+            html.Span(value, className="alert-kpi__value", style={"color": RISK_COLOR[risk]}),
+        ],
+    )
+
+
+def _event_pill(ts: int, label: str, value: float, risk: str, arrow: str) -> html.Div:
+    color = RISK_COLOR[risk]
+    return html.Div(
+        className="event-pill",
+        style={"borderColor": color},
+        children=[
+            html.Span(arrow, className="event-pill__arrow", style={"color": color}),
+            html.Span(_ts_to_clock(ts), className="event-pill__ts"),
+            html.Span(label, className="event-pill__label", style={"color": color}),
+            html.Span(f"{value:.1f}분", className="event-pill__value"),
+        ],
+    )
+
+
+def _trend_figure(values: list[float], risks: list[str], ts: int, events_info: dict | None = None) -> go.Figure:
     x = list(range(len(values)))
     y_max = max(max(values) * 1.15, RISK_THRESHOLDS["critical"] + 5)
 
@@ -453,25 +776,55 @@ def _trend_figure(values: list[float], risks: list[str], ts: int) -> go.Figure:
         fill="tozeroy", fillcolor="rgba(99,102,241,0.18)",
         hoverinfo="skip", showlegend=False,
     ))
+    clocks = [_ts_to_clock(i) for i in x]
     fig.add_trace(go.Scatter(
         x=x, y=values, mode="markers",
         marker={"size": 9, "color": [RISK_COLOR[r] for r in risks], "line": {"width": 0}},
-        hovertemplate="t=%{x}<br>예측=%{y:.2f}분<extra></extra>",
+        customdata=clocks,
+        hovertemplate="%{customdata}<br>예측=%{y:.2f}분<extra></extra>",
         showlegend=False,
     ))
     fig.add_trace(go.Scatter(
         x=[ts], y=[values[ts]], mode="markers",
         marker={"size": 18, "color": RISK_COLOR[risks[ts]],
                 "line": {"color": "#f8fafc", "width": 2.5}},
-        hovertemplate="현재 시점<br>t=%{x}<br>예측=%{y:.2f}분<extra></extra>",
+        hovertemplate=f"현재 시점 ({_ts_to_clock(ts)})<br>예측=%{{y:.2f}}분<extra></extra>",
         showlegend=False,
     ))
+
+    # 이벤트 어노테이션 (임계 진입/회복) — 최대 4개
+    if events_info and "events" in events_info:
+        for ev in events_info["events"][:4]:
+            kind = ev["kind"]
+            if kind == "enter_critical":
+                color = RISK_COLOR["critical"]; text = "▲ 임계 진입"; ay = -36
+            elif kind == "exit_critical":
+                color = RISK_COLOR["normal"]; text = "▼ 정상 회복"; ay = -32
+            elif kind == "enter_warning":
+                color = RISK_COLOR["warning"]; text = "▲ 경고"; ay = -28
+            else:
+                continue
+            fig.add_annotation(
+                x=ev["ts"], y=ev["value"],
+                text=f"{text} {_ts_to_clock(ev['ts'])}",
+                showarrow=True,
+                arrowhead=2, arrowsize=1, arrowwidth=1.5,
+                arrowcolor=color, ax=0, ay=ay,
+                font={"color": color, "size": 10, "family": "-apple-system, sans-serif"},
+                bgcolor="rgba(15,23,42,0.92)",
+                bordercolor=color, borderwidth=1, borderpad=4,
+                opacity=0.95,
+            )
+
     fig.update_layout(
         margin={"l": 50, "r": 30, "t": 10, "b": 40},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font={"color": "#e2e8f0"},
-        xaxis={"title": "timestep (시점)", "gridcolor": "#1e293b", "zeroline": False},
+        xaxis={"title": "시간 (15분 간격, 0~6시간)", "gridcolor": "#1e293b", "zeroline": False,
+               "tickmode": "array",
+               "tickvals": [0, 4, 8, 12, 16, 20, 24],
+               "ticktext": ["00:00", "01:00", "02:00", "03:00", "04:00", "05:00", "06:00"]},
         yaxis={"title": "분", "gridcolor": "#1e293b", "zeroline": False, "range": [0, y_max]},
         hoverlabel={"bgcolor": "#1e293b", "font": {"color": "#e2e8f0"}},
         transition={"duration": 280, "easing": "cubic-in-out"},
@@ -796,6 +1149,143 @@ def _risk_signal_item(rank: int, col: str, val: float, signed_z: float,
     )
 
 
+DOW_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def _pattern_figure(pivot, cur_dow: int | None, cur_hour: int | None) -> go.Figure:
+    if pivot is None:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="시간 컬럼 없음",
+            xref="paper", yref="paper", x=0.5, y=0.5,
+            showarrow=False, font={"color": "#64748b"},
+        )
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        return fig
+
+    z = pivot.values  # rows: dow 0..6, cols: hour 0..23
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        z=z,
+        x=[f"{h}시" for h in range(24)],
+        y=DOW_LABELS,
+        colorscale=[
+            [0.0, RISK_COLOR["normal"]],
+            [0.5, RISK_COLOR["warning"]],
+            [1.0, RISK_COLOR["critical"]],
+        ],
+        zmin=float(np.nanmin(z)),
+        zmax=float(np.nanmax(z)),
+        colorbar={
+            "title": {"text": "평균<br>지연", "font": {"color": "#94a3b8", "size": 10}},
+            "tickfont": {"color": "#94a3b8", "size": 10},
+            "outlinewidth": 0,
+            "thickness": 12,
+            "len": 0.85,
+            "ticksuffix": "분",
+        },
+        hovertemplate="%{y}요일 · %{x}<br>평균 %{z:.1f}분<extra></extra>",
+        xgap=1, ygap=1,
+    ))
+
+    # 현재 시점 마커
+    if cur_dow is not None and 0 <= cur_dow < 7 and cur_hour is not None and 0 <= cur_hour < 24:
+        fig.add_trace(go.Scatter(
+            x=[cur_hour], y=[cur_dow],
+            mode="markers",
+            marker={
+                "size": 22,
+                "color": "rgba(0,0,0,0)",
+                "line": {"color": "#f8fafc", "width": 3},
+                "symbol": "square",
+            },
+            hovertemplate=f"현재 시점의 요일·시간대<br>{DOW_LABELS[cur_dow]}요일 · {cur_hour}시<extra></extra>",
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        margin={"l": 50, "r": 30, "t": 10, "b": 50},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#e2e8f0"},
+        xaxis={
+            "gridcolor": "#1e293b", "zeroline": False,
+            "tickfont": {"size": 10, "color": "#94a3b8"},
+        },
+        yaxis={
+            "gridcolor": "#1e293b", "zeroline": False,
+            "autorange": "reversed",
+            "tickfont": {"size": 11, "color": "#cbd5e1"},
+        },
+        hoverlabel={"bgcolor": "#1e293b", "font": {"color": "#e2e8f0"}},
+    )
+    return fig
+
+
+def _pattern_side(pivot, overall_mean: float, cur_dow: int | None,
+                  cur_hour: int | None, cur_pred: float) -> list:
+    cards = []
+
+    # 전체 평균
+    cards.append(_pattern_card(
+        "전체 평균", f"{overall_mean:.1f}분", "(train 데이터 기준)", "#94a3b8",
+    ))
+
+    # 현재 시점 정보
+    if cur_dow is not None and cur_hour is not None and pivot is not None:
+        try:
+            cell = pivot.iloc[cur_dow][cur_hour] if cur_hour in pivot.columns else float("nan")
+        except (IndexError, KeyError):
+            cell = float("nan")
+        if pd.notna(cell):
+            cell_val = float(cell)
+            diff = cur_pred - cell_val
+            color = (
+                RISK_COLOR["critical"] if diff > 5 else
+                RISK_COLOR["warning"] if diff > 0 else
+                RISK_COLOR["normal"]
+            )
+            cards.append(_pattern_card(
+                f"이 시간대 평균 ({DOW_LABELS[cur_dow]}요일 {cur_hour}시)",
+                f"{cell_val:.1f}분",
+                f"이 시간대 train data 평균",
+                "#cbd5e1",
+            ))
+            cards.append(_pattern_card(
+                "현재 vs 시간대 평균",
+                f"{diff:+.1f}분",
+                "+ 면 평균 대비 더 위험" if diff > 0 else "− 면 평균 대비 양호",
+                color,
+            ))
+
+    # 가장 위험한 시간대
+    if pivot is not None:
+        try:
+            max_idx = pivot.stack().idxmax()  # (dow, hour)
+            max_val = pivot.stack().max()
+            cards.append(_pattern_card(
+                "최고 위험 시간대",
+                f"{DOW_LABELS[int(max_idx[0])]}요일 {int(max_idx[1])}시",
+                f"평균 {max_val:.1f}분 — 운영 주의",
+                RISK_COLOR["critical"],
+            ))
+        except Exception:
+            pass
+
+    return cards
+
+
+def _pattern_card(title: str, value: str, hint: str, color: str) -> html.Div:
+    return html.Div(
+        className="pattern-card",
+        children=[
+            html.Span(title, className="pattern-card__title"),
+            html.Span(value, className="pattern-card__value", style={"color": color}),
+            html.Span(hint, className="pattern-card__hint"),
+        ],
+    )
+
+
 def _layout_meta(layout_info_idx: pd.DataFrame, layout_id: str, cols: list[tuple[str, str]]):
     if layout_id not in layout_info_idx.index:
         return [html.Div("Layout meta 없음", className="layout-meta__cell")]
@@ -810,6 +1300,9 @@ def _layout_meta(layout_info_idx: pd.DataFrame, layout_id: str, cols: list[tuple
         v = row.get(col)
         if v is None or (isinstance(v, float) and pd.isna(v)):
             display = "—"
+        elif col in ("layout_type", "layout_class"):
+            kr = LAYOUT_TYPE_KR.get(str(v))
+            display = f"{v} ({kr})" if kr else str(v)
         elif isinstance(v, float):
             display = f"{v:.2f}" if abs(v) < 100 else f"{v:.0f}"
         else:
@@ -822,6 +1315,7 @@ def _layout_meta(layout_info_idx: pd.DataFrame, layout_id: str, cols: list[tuple
 
 
 def _timeline_dots(risks: list[str], ts: int):
+    """25개 시점 dot — 시점별 위험도 표시 (15분 간격)."""
     dots = []
     for i, r in enumerate(risks):
         cls = "timeline-dot"
@@ -830,7 +1324,7 @@ def _timeline_dots(risks: list[str], ts: int):
         dots.append(html.Span(
             className=cls,
             style={"backgroundColor": RISK_COLOR[r]},
-            title=f"t={i} · {RISK_LABEL[r]}",
+            title=f"{_ts_to_clock(i)} · {RISK_LABEL[r]}",
         ))
     return dots
 

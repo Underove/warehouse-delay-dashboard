@@ -55,9 +55,10 @@ def build_layout(
                         className="workflow",
                         children=[
                             _workflow_step("1", "Layout 선택", "분석할 창고 레이아웃 고르기"),
-                            _workflow_step("2", "시점 이동", "0~24 timestep 슬라이더로 시간 흐름 보기"),
+                            _workflow_step("2", "시점 이동", "15분 간격, 6시간 시뮬레이션 추적"),
                             _workflow_step("3", "위험 진단", "예측·원인·패턴 한눈에 확인"),
                             _workflow_step("4", "What-If (가상)", "신호를 바꿔 가상 시뮬레이션"),
+                            _workflow_step("5", "시간대 패턴", "요일·시간 평균 지연 매트릭스"),
                         ],
                     ),
                     html.Div(
@@ -92,7 +93,9 @@ def build_layout(
                             html.Div(
                                 className="controls__slider-header",
                                 children=[
-                                    html.Label("시점 (timestep)"),
+                                    html.Label(
+                                        "시점 (15분 간격 · 한 시나리오 = 6시간 시뮬레이션)"
+                                    ),
                                     html.Span(id="ts-readout", className="ts-readout"),
                                 ],
                             ),
@@ -105,7 +108,23 @@ def build_layout(
                                 value=0,
                                 className="dark-range",
                             ),
-                            html.Div(id="timeline-dots", className="timeline-dots"),
+                            html.Div(
+                                className="time-bounds",
+                                children=[
+                                    html.Span("00:00 (시작)", className="time-bounds__label"),
+                                    html.Span("06:00 (종료)", className="time-bounds__label"),
+                                ],
+                            ),
+                            html.Div(
+                                className="sample-dots-wrap",
+                                children=[
+                                    html.Span(
+                                        "각 칸 = 한 시점의 위험도 · 클릭으로 점프",
+                                        className="sample-dots-hint",
+                                    ),
+                                    html.Div(id="timeline-dots", className="timeline-dots"),
+                                ],
+                            ),
                         ],
                     ),
                 ],
@@ -115,10 +134,21 @@ def build_layout(
                 className="layout-meta",
             ),
             html.Section(
-                className="hero-section",
+                className="pipeline-section",
                 children=[
                     _section_head(
                         "1",
+                        "스마트 창고 물류 흐름",
+                        "주문 유입부터 출고까지 5단계 · 단계 색깔 = 현재 위험 등급",
+                    ),
+                    html.Div(id="pipeline-stages", className="pipeline-stages"),
+                ],
+            ),
+            html.Section(
+                className="hero-section",
+                children=[
+                    _section_head(
+                        "2",
                         "현재 예측",
                         "선택한 시점의 30분 후 평균 출고 지연 — 가운데 게이지로 위험도 한눈에",
                     ),
@@ -142,14 +172,15 @@ def build_layout(
                 className="trend-section",
                 children=[
                     _section_head(
-                        "2",
-                        "시점별 추이",
-                        "이 layout이 25 timestep 동안 어떻게 변하는지 — 현재 시점은 흰 테두리 점",
+                        "3",
+                        "시점별 예측 추이 + 알림",
+                        "6시간 시뮬레이션 동안 지연 변화 · 임계 진입/회복 자동 표시 · 흰 테두리 점 = 현재 시점",
                     ),
+                    html.Div(id="alerts-strip", className="alerts-strip"),
                     dcc.Graph(
                         id="trend-chart",
                         config={"displayModeBar": False},
-                        style={"height": "320px"},
+                        style={"height": "340px"},
                     ),
                 ],
             ),
@@ -157,9 +188,9 @@ def build_layout(
                 className="diagnose-wrap",
                 children=[
                     _section_head(
-                        "3",
+                        "4",
                         "원인 분해와 현재 신호",
-                        "예측을 만든 신호별 기여(분) + 현재 시점 핵심 신호값과 미니 추세",
+                        "예측을 만든 신호별 기여(분) + 현재 시점 핵심 신호값 · 미니 차트 = 6시간 추이",
                     ),
                     html.Div(
                         className="bottom-grid",
@@ -190,9 +221,9 @@ def build_layout(
                                     html.Div(
                                         className="panel-subhead",
                                         children=[
-                                            html.Span("현재 신호값", className="panel-subhead__title"),
+                                            html.Span("현재 시점 신호값", className="panel-subhead__title"),
                                             html.Span(
-                                                "값 + train 평균 대비 % · 미니 차트는 25 timestep 추세",
+                                                "값 + train 평균 대비 % · 미니 차트는 6시간 추이",
                                                 className="panel-subhead__hint",
                                             ),
                                         ],
@@ -208,7 +239,7 @@ def build_layout(
                 className="diagnostic-section",
                 children=[
                     _section_head(
-                        "4",
+                        "5",
                         "운영 패턴 진단",
                         "보라가 회색(평균) 밖으로 튀어나간 축이 위험 신호 · 빨간 꼭짓점은 평균보다 +25↑",
                     ),
@@ -241,10 +272,37 @@ def build_layout(
                 ],
             ),
             html.Section(
+                className="pattern-section",
+                children=[
+                    _section_head(
+                        "6",
+                        "시간대별 패턴",
+                        "요일 × 시간대 평균 지연 (train 전체) · 흰 테두리 셀 = 현재 시점의 요일·시간대",
+                    ),
+                    html.Div(
+                        className="pattern-grid",
+                        children=[
+                            html.Div(
+                                className="pattern-grid__panel",
+                                children=dcc.Graph(
+                                    id="pattern-chart",
+                                    config={"displayModeBar": False},
+                                    style={"height": "360px"},
+                                ),
+                            ),
+                            html.Div(
+                                className="pattern-grid__panel pattern-grid__panel--side",
+                                children=html.Div(id="pattern-side"),
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            html.Section(
                 className="whatif-section",
                 children=[
                     _section_head(
-                        "5",
+                        "7",
                         "What-If 시뮬레이션",
                         "왼쪽 슬라이더로 신호를 조정하면 오른쪽에 즉시 재예측 결과가 나타납니다",
                     ),
