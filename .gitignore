@@ -16,6 +16,7 @@ models/*.txt
 models/*.json
 models/*.pt
 models/*.bin
+models/*.npy
 
 .DS_Store
 .env
