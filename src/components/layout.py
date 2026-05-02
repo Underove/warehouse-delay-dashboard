@@ -58,7 +58,6 @@ def build_layout(
                             _workflow_step("2", "시점 이동", "15분 간격, 6시간 시뮬레이션 추적"),
                             _workflow_step("3", "위험 진단", "예측·원인·패턴 한눈에 확인"),
                             _workflow_step("4", "What-If (가상)", "신호를 바꿔 가상 시뮬레이션"),
-                            _workflow_step("5", "시간대 패턴", "요일·시간 평균 지연 매트릭스"),
                         ],
                     ),
                     html.Div(
@@ -333,42 +332,10 @@ def build_layout(
                 ],
             ),
             html.Section(
-                className="pattern-section",
-                children=[
-                    _section_head(
-                        "6",
-                        "시간대별 패턴",
-                        "요일 × 시간대 평균 지연 (train 전체) · 흰 테두리 셀 = 현재 시점의 요일·시간대",
-                        help_text=(
-                            "Heatmap 7요일 × 24시간. 각 셀 = train 전체에서 그 요일·시간 평균 지연. "
-                            "어두운 색 = 정상, 빨간 색 = 위험 시간대. "
-                            "흰 테두리 셀이 지금 분석 중인 시나리오의 요일·시간."
-                        ),
-                    ),
-                    html.Div(
-                        className="pattern-grid",
-                        children=[
-                            html.Div(
-                                className="pattern-grid__panel",
-                                children=dcc.Graph(
-                                    id="pattern-chart",
-                                    config={"displayModeBar": False},
-                                    style={"height": "360px"},
-                                ),
-                            ),
-                            html.Div(
-                                className="pattern-grid__panel pattern-grid__panel--side",
-                                children=html.Div(id="pattern-side"),
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-            html.Section(
                 className="whatif-section",
                 children=[
                     _section_head(
-                        "7",
+                        "6",
                         "What-If 시뮬레이션",
                         "왼쪽 슬라이더로 신호를 조정하면 오른쪽에 즉시 재예측 결과가 나타납니다",
                         help_text=(

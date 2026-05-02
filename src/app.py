@@ -176,22 +176,6 @@ def main() -> None:
             s = float(train[c].std(skipna=True))
             pipeline_stats[c] = {"mean": m, "std": s or 1.0}
 
-    # 시간대 패턴 (Phase 5): 요일 × 시간대 평균 지연
-    if "day_of_week" in train.columns and "shift_hour" in train.columns:
-        pat = (
-            train.dropna(subset=["day_of_week", "shift_hour"])
-            .groupby(["day_of_week", "shift_hour"])[TARGET]
-            .mean()
-            .unstack()
-            .sort_index()
-            .reindex(columns=range(24))
-        )
-        pattern_pivot = pat
-        pattern_overall_mean = float(train[TARGET].mean())
-    else:
-        pattern_pivot = None
-        pattern_overall_mean = float(train[TARGET].mean())
-
     layout_meta_cols = [(c, label) for c, label in LAYOUT_META_PREFERRED if c in layout_info.columns]
     if not layout_meta_cols:
         # fallback: layout_info의 layout_id 외 처음 4개 컬럼
@@ -407,8 +391,6 @@ def main() -> None:
         Output("schematic-chart", "figure"),
         Output("bottleneck-list", "children"),
         Output("alerts-strip", "children"),
-        Output("pattern-chart", "figure"),
-        Output("pattern-side", "children"),
         Output("pipeline-stages", "children"),
         Input("layout-picker", "value"),
         Input("scenario-picker", "value"),
@@ -428,7 +410,7 @@ def main() -> None:
             return (
                 html.Div("데이터 없음"), empty, empty, empty, [], [],
                 f"0/{SEQ_LEN}", "status-pill status-pill--normal", [], empty, [], [],
-                empty, [], [],
+                [],
             )
         ts = max(0, min(ts, len(seq) - 1))
         values = [p.value for p in preds]
@@ -444,14 +426,6 @@ def main() -> None:
         schematic = _radar_figure(current_row, radar_norm)
         bottlenecks = _top_risk_signals(current_row, radar_norm)
         events_info = _detect_events(preds)
-        cur_dow = current_row.get("day_of_week")
-        cur_hour = current_row.get("shift_hour")
-        cur_dow = int(cur_dow) if pd.notna(cur_dow) else None
-        cur_hour = int(cur_hour) if pd.notna(cur_hour) else None
-        pattern_fig = _pattern_figure(pattern_pivot, cur_dow, cur_hour)
-        pattern_side_card = _pattern_side(
-            pattern_pivot, pattern_overall_mean, cur_dow, cur_hour, current.value
-        )
         pipeline = _pipeline_stages(current_row, pipeline_stats)
 
         layout_type = None
@@ -473,8 +447,6 @@ def main() -> None:
             schematic,
             bottlenecks,
             _alerts_strip(events_info, ts, current),
-            pattern_fig,
-            pattern_side_card,
             pipeline,
         )
 
@@ -1302,143 +1274,6 @@ def _risk_signal_item(rank: int, col: str, val: float, signed_z: float,
                 ],
             ),
             html.Span(action, className="bottleneck-item__action"),
-        ],
-    )
-
-
-DOW_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
-
-
-def _pattern_figure(pivot, cur_dow: int | None, cur_hour: int | None) -> go.Figure:
-    if pivot is None:
-        fig = go.Figure()
-        fig.add_annotation(
-            text="시간 컬럼 없음",
-            xref="paper", yref="paper", x=0.5, y=0.5,
-            showarrow=False, font={"color": "#64748b"},
-        )
-        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-        return fig
-
-    z = pivot.values  # rows: dow 0..6, cols: hour 0..23
-    fig = go.Figure()
-    fig.add_trace(go.Heatmap(
-        z=z,
-        x=[f"{h}시" for h in range(24)],
-        y=DOW_LABELS,
-        colorscale=[
-            [0.0, RISK_COLOR["normal"]],
-            [0.5, RISK_COLOR["warning"]],
-            [1.0, RISK_COLOR["critical"]],
-        ],
-        zmin=float(np.nanmin(z)),
-        zmax=float(np.nanmax(z)),
-        colorbar={
-            "title": {"text": "평균<br>지연", "font": {"color": "#94a3b8", "size": 10}},
-            "tickfont": {"color": "#94a3b8", "size": 10},
-            "outlinewidth": 0,
-            "thickness": 12,
-            "len": 0.85,
-            "ticksuffix": "분",
-        },
-        hovertemplate="%{y}요일 · %{x}<br>평균 %{z:.1f}분<extra></extra>",
-        xgap=1, ygap=1,
-    ))
-
-    # 현재 시점 마커
-    if cur_dow is not None and 0 <= cur_dow < 7 and cur_hour is not None and 0 <= cur_hour < 24:
-        fig.add_trace(go.Scatter(
-            x=[cur_hour], y=[cur_dow],
-            mode="markers",
-            marker={
-                "size": 22,
-                "color": "rgba(0,0,0,0)",
-                "line": {"color": "#f8fafc", "width": 3},
-                "symbol": "square",
-            },
-            hovertemplate=f"현재 시점의 요일·시간대<br>{DOW_LABELS[cur_dow]}요일 · {cur_hour}시<extra></extra>",
-            showlegend=False,
-        ))
-
-    fig.update_layout(
-        margin={"l": 50, "r": 30, "t": 10, "b": 50},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font={"color": "#e2e8f0"},
-        xaxis={
-            "gridcolor": "#1e293b", "zeroline": False,
-            "tickfont": {"size": 10, "color": "#94a3b8"},
-        },
-        yaxis={
-            "gridcolor": "#1e293b", "zeroline": False,
-            "autorange": "reversed",
-            "tickfont": {"size": 11, "color": "#cbd5e1"},
-        },
-        hoverlabel={"bgcolor": "#1e293b", "font": {"color": "#e2e8f0"}},
-    )
-    return fig
-
-
-def _pattern_side(pivot, overall_mean: float, cur_dow: int | None,
-                  cur_hour: int | None, cur_pred: float) -> list:
-    cards = []
-
-    # 전체 평균
-    cards.append(_pattern_card(
-        "전체 평균", f"{overall_mean:.1f}분", "(train 데이터 기준)", "#94a3b8",
-    ))
-
-    # 현재 시점 정보
-    if cur_dow is not None and cur_hour is not None and pivot is not None:
-        try:
-            cell = pivot.iloc[cur_dow][cur_hour] if cur_hour in pivot.columns else float("nan")
-        except (IndexError, KeyError):
-            cell = float("nan")
-        if pd.notna(cell):
-            cell_val = float(cell)
-            diff = cur_pred - cell_val
-            color = (
-                RISK_COLOR["critical"] if diff > 5 else
-                RISK_COLOR["warning"] if diff > 0 else
-                RISK_COLOR["normal"]
-            )
-            cards.append(_pattern_card(
-                f"이 시간대 평균 ({DOW_LABELS[cur_dow]}요일 {cur_hour}시)",
-                f"{cell_val:.1f}분",
-                f"이 시간대 train data 평균",
-                "#cbd5e1",
-            ))
-            cards.append(_pattern_card(
-                "현재 vs 시간대 평균",
-                f"{diff:+.1f}분",
-                "+ 면 평균 대비 더 위험" if diff > 0 else "− 면 평균 대비 양호",
-                color,
-            ))
-
-    # 가장 위험한 시간대
-    if pivot is not None:
-        try:
-            max_idx = pivot.stack().idxmax()  # (dow, hour)
-            max_val = pivot.stack().max()
-            cards.append(_pattern_card(
-                "최고 위험 시간대",
-                f"{DOW_LABELS[int(max_idx[0])]}요일 {int(max_idx[1])}시",
-                f"평균 {max_val:.1f}분 — 운영 주의",
-                RISK_COLOR["critical"],
-            ))
-        except Exception:
-            pass
-
-    return cards
-
-
-def _pattern_card(title: str, value: str, hint: str, color: str) -> html.Div:
-    return html.Div(
-        className="pattern-card",
-        children=[
-            html.Span(title, className="pattern-card__title"),
-            html.Span(value, className="pattern-card__value", style={"color": color}),
-            html.Span(hint, className="pattern-card__hint"),
         ],
     )
 
