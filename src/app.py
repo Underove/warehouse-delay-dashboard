@@ -4,13 +4,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dash import ALL, Dash, Input, Output, State, ctx, html, no_update
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from config import ASSETS_DIR, RISK_THRESHOLDS, SEQ_LEN, TARGET
+from config import ASSETS_DIR, RISK_THRESHOLDS, SEQ_LEN
 from src.components.layout import build_layout
 from src.data_loader import load_layout, load_test, load_train
 from src.inference import _classify_risk, load_predictor
@@ -29,6 +28,164 @@ SIGNAL_LABEL = {
     "pack_utilization": "패킹 가동률",
 }
 GAUGE_MAX = 40.0
+
+# ── 피처 한국어 레이블 ──────────────────────────────────────────────────────────
+FEATURE_LABEL_KR: dict[str, str] = {
+    # 주문 / 수요
+    "order_inflow_15m":       "주문 유입량 (15분)",
+    "unique_sku_15m":         "SKU 다양도 (15분)",
+    "avg_items_per_order":    "주문당 평균 품목",
+    "urgent_order_ratio":     "긴급 주문 비율",
+    "heavy_item_ratio":       "중량 품목 비율",
+    "cold_chain_ratio":       "냉장 비율",
+    "sku_concentration":      "SKU 집중도",
+    "return_order_ratio":     "반품 주문 비율",
+    "bulk_order_ratio":       "대량 주문 비율",
+    "order_wave_count":       "주문 웨이브 횟수",
+    "pick_list_length_avg":   "피킹 리스트 길이",
+    "express_lane_util":      "신속 라인 가동률",
+    "prev_shift_volume":      "이전 교대 처리량",
+    # AMR / 로봇
+    "robot_idle":             "AMR 유휴 대수",
+    "robot_active":           "AMR 가동 대수",
+    "robot_utilization":      "AMR 가동률",
+    "robot_charging":         "AMR 충전 대수",
+    "avg_trip_distance":      "AMR 평균 이동 거리",
+    "avg_idle_duration_min":  "AMR 평균 유휴 시간",
+    "charge_efficiency_pct":  "충전 효율",
+    "battery_cycle_count_avg":"배터리 사이클 횟수",
+    "agv_task_success_rate":  "AGV 작업 성공률",
+    "robot_calibration_score":"AMR 교정 점수",
+    "fleet_age_months_avg":   "AMR 평균 운용 월수",
+    "robot_firmware_update_days": "AMR 펌웨어 업데이트 경과일",
+    "robot_total":            "총 AMR 수",
+    "charger_count":          "충전소 수",
+    # 배터리
+    "battery_mean":           "배터리 평균 잔량",
+    "battery_std":            "배터리 잔량 편차",
+    "low_battery_ratio":      "저배터리 비율",
+    # 통로 / 혼잡
+    "congestion_score":       "통로 혼잡도",
+    "max_zone_density":       "구역 최대 밀집도",
+    "aisle_traffic_score":    "통로 교통 점수",
+    "path_optimization_score":"경로 최적화 점수",
+    "intersection_wait_time_avg": "교차로 평균 대기 시간",
+    "aisle_width_avg":        "평균 통로 폭",
+    "intersection_count":     "교차로 수",
+    "one_way_ratio":          "일방통행 비율",
+    # 패킹 / 출고
+    "pack_utilization":       "패킹 가동률",
+    "staging_area_util":      "스테이징 구역 가동률",
+    "outbound_truck_wait_min":"출고 트럭 대기 시간",
+    "loading_dock_util":      "하역장 가동률",
+    "dock_to_stock_hours":    "입고→보관 소요 시간",
+    "pallet_wrap_time_min":   "파렛트 포장 시간",
+    "packaging_material_cost":"포장 재료 비용",
+    "cross_dock_ratio":       "크로스 도킹 비율",
+    "pack_station_count":     "패킹 스테이션 수",
+    "conveyor_speed_mps":     "컨베이어 속도",
+    # 창고 운영
+    "manual_override_ratio":  "수동 전환 비율",
+    "replenishment_overlap":  "보충 작업 겹침",
+    "quality_check_rate":     "품질 검수율",
+    "sort_accuracy_pct":      "분류 정확도",
+    "barcode_read_success_rate": "바코드 인식률",
+    "label_print_queue":      "라벨 출력 대기열",
+    "scanner_error_rate":     "스캐너 오류율",
+    "forklift_active_count":  "지게차 가동 대수",
+    "staff_on_floor":         "현장 작업자 수",
+    "shift_handover_delay_min":"교대 인계 지연",
+    "shift_hour":             "교대 시간대",
+    "worker_avg_tenure_months":"작업자 평균 근무 기간",
+    "safety_score_monthly":   "월간 안전 점수",
+    # 재고 / KPI
+    "storage_density_pct":    "보관 밀집도",
+    "inventory_turnover_rate":"재고 회전율",
+    "daily_forecast_accuracy":"수요 예측 정확도",
+    "backorder_ratio":        "백오더 비율",
+    "kpi_otd_pct":            "정시 출고율 (OTD)",
+    "avg_package_weight_kg":  "평균 포장 중량",
+    # 환경
+    "warehouse_temp_avg":     "창고 평균 온도",
+    "humidity_pct":           "습도",
+    "external_temp_c":        "외부 기온",
+    "wind_speed_kmh":         "풍속",
+    "precipitation_mm":       "강수량",
+    "lighting_level_lux":     "조도",
+    "ambient_noise_db":       "주변 소음",
+    "floor_vibration_idx":    "바닥 진동",
+    "air_quality_idx":        "공기질 지수",
+    "co2_level_ppm":          "CO₂ 농도",
+    "hvac_power_kw":          "공조 전력",
+    "zone_temp_variance":     "구역 온도 편차",
+    "cold_storage_temp_c":    "냉장 보관 온도",
+    # IT 인프라
+    "wms_response_time_ms":   "WMS 응답 시간",
+    "wifi_signal_db":         "Wi-Fi 신호 세기",
+    "network_latency_ms":     "네트워크 지연",
+    "ups_battery_pct":        "UPS 배터리 잔량",
+    # 레이아웃
+    "vertical_utilization":   "수직 공간 활용률",
+    "racking_height_avg_m":   "평균 랙 높이",
+    "layout_compactness":     "레이아웃 압축도",
+    "zone_dispersion":        "구역 분산도",
+    "lighting_zone_variance": "조도 구역 편차",
+    "building_age_years":     "건물 연수",
+    "floor_area_sqm":         "바닥 면적",
+    "ceiling_height_m":       "천장 높이",
+    "day_of_week":            "요일",
+    "ts_rank":                "시뮬레이션 시점",
+    "maintenance_schedule_score": "유지보수 일정 점수",
+    "fire_sprinkler_count":   "스프링클러 수",
+    "emergency_exit_count":   "비상구 수",
+    # 복합 엔지니어드 피처
+    "order_speed_ratio":      "주문 처리 속도 비율",
+    "packing_pressure":       "패킹 압박 지수",
+    "is_full_density":        "최대 밀집 여부",
+    "order_cumsum":           "주문 누적량",
+    "order_roll4_sum":        "주문 4시점 합계",
+    "accel_roll3_mean":       "주문 가속도 (3시점)",
+    "true_congestion_penalty":"실혼잡 패널티",
+    "packing_bottleneck":     "패킹 병목 지수",
+    "robot_density":          "AMR 밀집도",
+    "charger_queue_pressure": "충전 큐 압박",
+    "backlog_per_robot":      "AMR당 미처리 주문",
+    "bottleneck_intensity":   "병목 강도",
+    "congestion_x_narrow":    "혼잡 × 협소 통로",
+    "order_pressure_x_hub_spoke": "주문 압박 × 허브형",
+    "layout_structural_risk": "레이아웃 구조 리스크",
+    "battery_recovery_burden":"배터리 회복 부담",
+    "hrc_load_factor":        "HRC 부하 계수",
+    "wms_load_pressure":      "WMS 부하 압박",
+    "agv_congestion_risk":    "AGV 혼잡 리스크",
+    "path_congestion_risk":   "경로 혼잡 리스크",
+    "staff_order_pressure":   "직원-주문 압박",
+    "truck_backlog_pressure": "트럭 백로그 압박",
+    "total_intersection_delay":"교차로 총 지연",
+    "knn_target_mean":        "KNN 예측 평균",
+    "knn_target_std":         "KNN 예측 편차",
+    "knn_target_max":         "KNN 예측 최대",
+}
+
+_SUFFIX_KR = [
+    ("_pure_past_roll4", " (과거 4시점 평균)"),
+    ("_roll4_mean",      " (4시점 평균)"),
+    ("_sc_mean",         " (시나리오 평균)"),
+    ("_lag1",            " (1시점 전)"),
+    ("_lag2",            " (2시점 전)"),
+    ("_delta",           " (변화량)"),
+]
+
+
+def _feature_label(name: str) -> str:
+    if name in FEATURE_LABEL_KR:
+        return FEATURE_LABEL_KR[name]
+    for suffix, suffix_kr in _SUFFIX_KR:
+        if name.endswith(suffix):
+            base = name[: -len(suffix)]
+            base_kr = FEATURE_LABEL_KR.get(base, base.replace("_", " "))
+            return f"{base_kr}{suffix_kr}"
+    return name.replace("_", " ")
 
 
 def _prepare_test(test: pd.DataFrame) -> pd.DataFrame:
@@ -387,6 +544,7 @@ def main() -> None:
         Output("timeline-dots", "children"),
         Output("ts-readout", "children"),
         Output("status-pill", "className"),
+        Output("status-pill", "children"),
         Output("layout-meta", "children"),
         Output("schematic-chart", "figure"),
         Output("bottleneck-list", "children"),
@@ -409,8 +567,8 @@ def main() -> None:
             empty = go.Figure()
             return (
                 html.Div("데이터 없음"), empty, empty, empty, [], [],
-                f"0/{SEQ_LEN}", "status-pill status-pill--normal", [], empty, [], [],
-                [],
+                f"0/{SEQ_LEN}", "status-pill status-pill--normal", "LIVE",
+                [], empty, [], [], [],
             )
         ts = max(0, min(ts, len(seq) - 1))
         values = [p.value for p in preds]
@@ -443,6 +601,7 @@ def main() -> None:
             _timeline_dots(risks, ts),
             f"{_ts_to_elapsed(ts)} · {ts + 1}/{len(seq)} 시점",
             f"status-pill status-pill--{current.risk}",
+            f"LIVE · {RISK_LABEL[current.risk]}",
             _layout_meta(layout_info_idx, str(layout_id), layout_meta_cols),
             schematic,
             bottlenecks,
@@ -723,7 +882,7 @@ def _gauge_figure(value: float, risk: str) -> go.Figure:
                     "tickcolor": "#475569",
                     "tickfont": {"color": "#94a3b8", "size": 11},
                 },
-                "bar": {"color": color, "thickness": 0.28},
+                "bar": {"color": color, "thickness": 0.36},
                 "bgcolor": "rgba(0,0,0,0)",
                 "borderwidth": 0,
                 "steps": [
@@ -745,11 +904,6 @@ def _gauge_figure(value: float, risk: str) -> go.Figure:
         font={"color": "#e2e8f0"},
     )
     return fig
-
-
-def _ts_to_clock(ts: int) -> str:
-    """timestep 0-24 → 경과 분 표기 (15분 간격). 절대 시각 아님."""
-    return f"{ts * 15}분"
 
 
 def _ts_to_elapsed(ts: int) -> str:
@@ -883,7 +1037,7 @@ def _trend_figure(values: list[float], risks: list[str], ts: int, events_info: d
     fig.add_trace(go.Scatter(
         x=x, y=values, mode="lines",
         line={"color": "#818cf8", "width": 2.5},
-        fill="tozeroy", fillcolor="rgba(99,102,241,0.18)",
+        fill="tozeroy", fillcolor="rgba(99,102,241,0.12)",
         hoverinfo="skip", showlegend=False,
     ))
 
@@ -891,17 +1045,21 @@ def _trend_figure(values: list[float], risks: list[str], ts: int, events_info: d
     scenario_mean = sum(values) / len(values) if values else 0
     fig.add_hline(
         y=scenario_mean,
-        line_dash="dot", line_color="#94a3b8", line_width=1.5,
-        annotation_text=f"시나리오 평균 {scenario_mean:.1f}분",
+        line_dash="dot", line_color="#64748b", line_width=1.5,
+        annotation_text=f"시나리오 평균  {scenario_mean:.1f}분",
         annotation_position="top right",
-        annotation_font={"color": "#94a3b8", "size": 10},
+        annotation_font={"color": "#64748b", "size": 10},
     )
     elapsed_labels = [_ts_to_elapsed(i) for i in x]
     fig.add_trace(go.Scatter(
         x=x, y=values, mode="markers",
-        marker={"size": 9, "color": [RISK_COLOR[r] for r in risks], "line": {"width": 0}},
+        marker={
+            "size": 8,
+            "color": [RISK_COLOR[r] for r in risks],
+            "line": {"color": "rgba(15,23,42,0.6)", "width": 1},
+        },
         customdata=elapsed_labels,
-        hovertemplate="%{customdata}<br>예측=%{y:.2f}분<extra></extra>",
+        hovertemplate="%{customdata}<br>예측 %{y:.1f}분<extra></extra>",
         showlegend=False,
     ))
     fig.add_trace(go.Scatter(
@@ -945,7 +1103,12 @@ def _trend_figure(values: list[float], risks: list[str], ts: int, events_info: d
                "tickmode": "array",
                "tickvals": [0, 4, 8, 12, 16, 20, 24],
                "ticktext": ["0분", "60분", "120분", "180분", "240분", "300분", "360분"]},
-        yaxis={"title": "분", "gridcolor": "#1e293b", "zeroline": False, "range": [0, y_max]},
+        yaxis={
+            "title": "지연 예측 (분)",
+            "gridcolor": "#1e293b", "zeroline": False, "range": [0, y_max],
+            "tickfont": {"color": "#94a3b8", "size": 11},
+            "title_font": {"color": "#94a3b8", "size": 11},
+        },
         hoverlabel={"bgcolor": "#1e293b", "font": {"color": "#e2e8f0"}},
         transition={"duration": 280, "easing": "cubic-in-out"},
     )
@@ -965,27 +1128,36 @@ def _contrib_figure(contrib: dict[str, float]) -> go.Figure:
         return fig
 
     items = sorted(contrib.items(), key=lambda kv: abs(kv[1]))
-    labels = [SIGNAL_LABEL.get(k, k) for k, _ in items]
+    labels = [_feature_label(k) for k, _ in items]
     vals = [v for _, v in items]
     colors = [RISK_COLOR["critical"] if v > 0 else RISK_COLOR["normal"] for v in vals]
 
     fig.add_trace(go.Bar(
         x=vals, y=labels, orientation="h",
         marker={"color": colors, "line": {"width": 0}},
-        text=[f"{v:+.2f}" for v in vals],
+        text=[f"{v:+.2f}분" for v in vals],
         textposition="outside", cliponaxis=False,
+        textfont={"size": 10, "color": "#e2e8f0"},
         hovertemplate="%{y}<br>기여 %{x:+.2f}분<extra></extra>",
     ))
-    extreme = max(abs(v) for v in vals) * 1.4 or 1.0
+    extreme = max(abs(v) for v in vals) * 1.5 or 1.0
     fig.add_vline(x=0, line_color="#475569", line_width=1)
     fig.update_layout(
-        margin={"l": 130, "r": 30, "t": 10, "b": 30},
+        margin={"l": 16, "r": 60, "t": 10, "b": 30},
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font={"color": "#e2e8f0"},
-        xaxis={"title": "기여 (분, +지연증가 / -지연감소)",
-               "gridcolor": "#1e293b", "zeroline": False,
-               "range": [-extreme, extreme]},
-        yaxis={"gridcolor": "#1e293b", "zeroline": False},
+        xaxis={
+            "title": "기여도 (분)",
+            "title_font": {"color": "#94a3b8", "size": 11},
+            "gridcolor": "#1e293b", "zeroline": False,
+            "range": [-extreme, extreme],
+            "tickfont": {"color": "#94a3b8", "size": 10},
+        },
+        yaxis={
+            "gridcolor": "#1e293b", "zeroline": False,
+            "tickfont": {"size": 11, "color": "#e2e8f0"},
+            "automargin": True,
+        },
         hoverlabel={"bgcolor": "#1e293b", "font": {"color": "#e2e8f0"}},
         transition={"duration": 220, "easing": "cubic-in-out"},
     )
@@ -1145,27 +1317,27 @@ def _radar_figure(row: pd.Series, radar_norm: dict) -> go.Figure:
         showlegend=False, hoverinfo="skip",
     ))
 
-    # train 평균 — 점선 outline + 옅은 fill
+    # train 평균 — 점선 outline + 채움
     fig.add_trace(go.Scatterpolar(
         r=avg_closed, theta=labels_closed,
         fill="toself",
-        fillcolor="rgba(148,163,184,0.06)",
+        fillcolor="rgba(148,163,184,0.14)",
         line={"color": "#94a3b8", "width": 2, "dash": "dot"},
         name="train 평균",
         hovertemplate="<b>%{theta}</b><br>평균 %{r:.0f}/100<extra></extra>",
     ))
 
-    # 현재 — 강한 fill + 굵은 선 + vertex별 위험색 마커
+    # 현재 — fill + 굵은 선 + vertex별 위험색 마커
     fig.add_trace(go.Scatterpolar(
         r=cur_closed, theta=labels_closed,
         fill="toself",
-        fillcolor="rgba(129,140,248,0.42)",
-        line={"color": "#a5b4fc", "width": 3.5, "shape": "linear"},
+        fillcolor="rgba(129,140,248,0.30)",
+        line={"color": "#a5b4fc", "width": 3},
         mode="lines+markers",
         marker={
-            "size": 14,
+            "size": 12,
             "color": vertex_colors_closed,
-            "line": {"color": vertex_lines_closed, "width": 2.5},
+            "line": {"color": vertex_lines_closed, "width": 2},
             "symbol": "circle",
         },
         name="현재",
@@ -1178,21 +1350,21 @@ def _radar_figure(row: pd.Series, radar_norm: dict) -> go.Figure:
             "radialaxis": {
                 "visible": True,
                 "range": [0, 100],
-                "tickfont": {"color": "#94a3b8", "size": 11},
+                "tickfont": {"color": "#94a3b8", "size": 10},
                 "gridcolor": "rgba(71,85,105,0.45)",
                 "linecolor": "rgba(71,85,105,0.45)",
                 "tickvals": [25, 50, 75, 100],
                 "tickangle": 45,
             },
             "angularaxis": {
-                "tickfont": {"color": "#f1f5f9", "size": 14, "family": "-apple-system, sans-serif"},
+                "tickfont": {"color": "#f1f5f9", "size": 12, "family": "-apple-system, sans-serif"},
                 "gridcolor": "rgba(71,85,105,0.45)",
                 "linecolor": "rgba(71,85,105,0.45)",
                 "rotation": 90,
                 "direction": "clockwise",
             },
         },
-        margin={"l": 70, "r": 70, "t": 40, "b": 60},
+        margin={"l": 90, "r": 90, "t": 50, "b": 70},
         paper_bgcolor="rgba(0,0,0,0)",
         font={"color": "#e2e8f0"},
         showlegend=True,
@@ -1390,7 +1562,7 @@ def _whatif_delta_figure(base_contrib: dict, new_contrib: dict) -> go.Figure:
         key=lambda k: -max(abs(base_contrib.get(k, 0.0)), abs(new_contrib.get(k, 0.0))),
     )
     keys = all_keys[:8]
-    labels = [SIGNAL_LABEL.get(k, k) for k in keys]
+    labels = [_feature_label(k) for k in keys]
     base_vals = [base_contrib.get(k, 0.0) for k in keys]
     new_vals = [new_contrib.get(k, 0.0) for k in keys]
 
@@ -1398,27 +1570,38 @@ def _whatif_delta_figure(base_contrib: dict, new_contrib: dict) -> go.Figure:
     fig.add_trace(go.Bar(
         y=labels, x=base_vals, orientation="h",
         name="현재",
-        marker={"color": "#475569"},
-        hovertemplate="%{y}<br>현재 %{x:+.2f}<extra></extra>",
+        marker={"color": "#38bdf8", "opacity": 0.9},
+        hovertemplate="%{y}<br>현재 %{x:+.2f}분<extra></extra>",
     ))
     fig.add_trace(go.Bar(
         y=labels, x=new_vals, orientation="h",
-        name="What-If (가상)",
-        marker={"color": "#818cf8"},
-        hovertemplate="%{y}<br>What-If %{x:+.2f}<extra></extra>",
+        name="What-If",
+        marker={"color": "#f97316"},
+        hovertemplate="%{y}<br>What-If %{x:+.2f}분<extra></extra>",
     ))
-    extreme = max([abs(v) for v in base_vals + new_vals] or [1.0]) * 1.3 or 1.0
+    extreme = max([abs(v) for v in base_vals + new_vals] or [1.0]) * 1.4 or 1.0
     fig.add_vline(x=0, line_color="#475569", line_width=1)
     fig.update_layout(
         barmode="group",
-        margin={"l": 130, "r": 20, "t": 10, "b": 30},
+        margin={"l": 16, "r": 20, "t": 28, "b": 30},
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font={"color": "#e2e8f0"},
-        xaxis={"title": "기여 (분)", "gridcolor": "#1e293b",
-               "zeroline": False, "range": [-extreme, extreme]},
-        yaxis={"gridcolor": "#1e293b", "zeroline": False},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0,
-                "bgcolor": "rgba(0,0,0,0)", "font": {"color": "#cbd5e1"}},
+        xaxis={
+            "title": "기여도 (분)",
+            "title_font": {"color": "#94a3b8", "size": 11},
+            "gridcolor": "#1e293b", "zeroline": False,
+            "range": [-extreme, extreme],
+            "tickfont": {"color": "#94a3b8", "size": 10},
+        },
+        yaxis={
+            "gridcolor": "#1e293b", "zeroline": False,
+            "tickfont": {"size": 11, "color": "#e2e8f0"},
+            "automargin": True,
+        },
+        legend={
+            "orientation": "h", "yanchor": "bottom", "y": 1.0, "x": 0,
+            "bgcolor": "rgba(0,0,0,0)", "font": {"color": "#cbd5e1", "size": 11},
+        },
         hoverlabel={"bgcolor": "#1e293b", "font": {"color": "#e2e8f0"}},
     )
     return fig

@@ -44,7 +44,7 @@ def build_layout(
                     html.Div(
                         id="status-pill",
                         className="status-pill status-pill--normal",
-                        children="LIVE · MOCK",
+                        children="LIVE",
                     ),
                 ],
             ),
@@ -64,9 +64,9 @@ def build_layout(
                         className="risk-legend",
                         children=[
                             html.Span("위험도 기준", className="risk-legend__label"),
-                            _risk_chip("정상", "< 15분", "normal"),
-                            _risk_chip("경고", "15~22분", "warning"),
-                            _risk_chip("임계", "≥ 22분", "critical"),
+                            _risk_chip("정상", "< 22분", "normal"),
+                            _risk_chip("경고", "22~30분", "warning"),
+                            _risk_chip("임계", "≥ 30분", "critical"),
                         ],
                     ),
                 ],
@@ -257,7 +257,7 @@ def build_layout(
                                         children=[
                                             html.Span("기여도 (분)", className="panel-subhead__title"),
                                             html.Span(
-                                                "+ 면 지연 증가, − 면 감소 · Mock (모델 오면 SHAP)",
+                                                "+ 면 지연 증가, − 면 감소 · SHAP (LGB+CB 기여도)",
                                                 className="panel-subhead__hint",
                                             ),
                                         ],
