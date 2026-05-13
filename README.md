@@ -1,4 +1,4 @@
-# Warehouse Delay Dashboard
+# 🚨 Warehouse Delay Dashboard
 
 Dacon "스마트 물류창고 출고 지연 예측" 대회의 4-model 앙상블(LB 9.99)을 운영 의사결정 도구로 전환한 Dash 대시보드.  
 운영자가 **예측 → 진단 → 시뮬레이션 → 액션**을 한 화면에서 처리할 수 있도록 설계했습니다.
