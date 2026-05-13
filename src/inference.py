@@ -27,9 +27,11 @@ from config import MODEL_DIR, RISK_THRESHOLDS, ROOT
 TEST_FEATURES_PARQUET = ROOT / "data" / "test_features.parquet"
 TEST_SEQ_NPY          = ROOT / "data" / "test_seq.npy"
 TEST_SEQ_INDEX        = ROOT / "data" / "test_seq_index.parquet"
+TEST_SHAP_NPY         = ROOT / "data" / "test_shap.npy"
 SEQ_SCALER_PKL        = MODEL_DIR / "seq_scaler.pkl"
-N_FOLDS = 5
-DEVICE  = torch.device("cpu")
+N_FOLDS    = 5
+TOP_SHAP   = 8     # 기여도 차트에 표시할 피처 수
+DEVICE     = torch.device("cpu")
 
 
 @dataclass
@@ -151,7 +153,7 @@ class EnsemblePredictor(MockPredictor):
     LGB + CB + BiGRU + BiGRU+Attn 4-model 앙상블.
 
     시퀀스 모델은 시나리오 단위로 한 번만 forward하고 내부 캐시(_seq_cache)에 저장.
-    contributions는 MockPredictor의 z-score 방식 유지 (SHAP 통합 전).
+    기여도: test_shap.npy 캐시 O(1) lookup (What-If 시 단일 row 즉시 계산).
     """
 
     def __init__(
@@ -231,12 +233,30 @@ class EnsemblePredictor(MockPredictor):
             print(f"[inference] seq models loaded  shape={self._test_seq.shape}")
         else:
             print("[inference] seq models unavailable — running tree-only")
-            # seq 모델 없으면 lgb+cb 가중치를 합 1로 재정규화
             total = self.w_lgb + self.w_cb
             if total > 0:
                 self.w_lgb /= total
                 self.w_cb  /= total
             self.active_models = ("lgb", "cb")
+
+        # ── SHAP 캐시 ────────────────────────────────────────────────────────
+        if TEST_SHAP_NPY.exists():
+            import shap as _shap
+            self._shap_arr = np.load(TEST_SHAP_NPY)           # (50000, 168)
+            self._id_to_shap_idx = {
+                rid: i for i, rid in enumerate(feats["ID"])
+            }
+            # What-If 단일 row 계산용 fold0 explainer
+            self._shap_ex_lgb = _shap.TreeExplainer(self.lgb_models[0])
+            self._shap_ex_cb  = _shap.TreeExplainer(self.cb_models[0])
+            w_total = self.w_lgb + self.w_cb
+            self._shap_w_lgb = self.w_lgb / w_total if w_total > 0 else 0.5
+            self._shap_w_cb  = self.w_cb  / w_total if w_total > 0 else 0.5
+            self._shap_enabled = True
+            print(f"[inference] shap cache loaded  shape={self._shap_arr.shape}")
+        else:
+            self._shap_enabled = False
+            print("[inference] shap cache unavailable — using z-score contributions")
 
     @staticmethod
     def _load_pt(path: Path, model: nn.Module) -> nn.Module:
@@ -280,11 +300,44 @@ class EnsemblePredictor(MockPredictor):
         self._seq_cache[scenario_idx] = (gru_preds, attn_preds)
         return gru_preds, attn_preds
 
+    def _shap_contributions(
+        self,
+        feat_row: pd.DataFrame,
+        pred_minutes: float,
+        rid: str | None,
+        has_overrides: bool,
+    ) -> dict[str, float]:
+        """SHAP 기여도 → top 8 피처 dict (값: 근사 분 단위).
+
+        캐시 hit: O(1) lookup.
+        What-If (has_overrides=True): fold0 LGB+CB 단일 row 즉시 계산.
+        scale: shap_i_log * (pred_minutes + 1)  — log1p 공간 Jacobian 근사.
+        """
+        if not self._shap_enabled:
+            return self._signal_contributions(feat_row.iloc[0])
+
+        X = feat_row[self.tree_feature_cols].values  # (1, 168)
+
+        if has_overrides or rid is None or rid not in self._id_to_shap_idx:
+            sv_lgb = self._shap_ex_lgb.shap_values(X)[0]
+            sv_cb  = self._shap_ex_cb.shap_values(X)[0]
+            sv = self._shap_w_lgb * sv_lgb + self._shap_w_cb * sv_cb
+        else:
+            sv = self._shap_arr[self._id_to_shap_idx[rid]]  # (168,)
+
+        scale = pred_minutes + 1.0
+        contribs_raw = sv * scale
+
+        top_idx = np.argsort(np.abs(contribs_raw))[-TOP_SHAP:]
+        return {
+            self.tree_feature_cols[i]: round(float(contribs_raw[i]), 3)
+            for i in top_idx
+        }
+
     # ── 공개 API ──────────────────────────────────────────────────────────────
 
     def predict_one(self, row: pd.Series) -> Prediction:
         rid = row.get("ID")
-        contribs = self._signal_contributions(row)
 
         if rid is None or rid not in self.feature_table.index:
             return super().predict_one(row)
@@ -325,7 +378,9 @@ class EnsemblePredictor(MockPredictor):
         else:
             value = self.w_lgb * lgb_val + self.w_cb * cb_val
 
-        return Prediction(value=max(0.0, value), risk=_classify_risk(value), contributions=contribs)
+        value = max(0.0, value)
+        contribs = self._shap_contributions(feat_row, value, rid, bool(overrides))
+        return Prediction(value=value, risk=_classify_risk(value), contributions=contribs)
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         if "ID" not in df.columns:

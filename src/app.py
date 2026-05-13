@@ -1385,7 +1385,11 @@ def _whatif_comparison(base, new) -> html.Div:
 
 
 def _whatif_delta_figure(base_contrib: dict, new_contrib: dict) -> go.Figure:
-    keys = list(SIGNAL_COLS)
+    all_keys = sorted(
+        set(base_contrib) | set(new_contrib),
+        key=lambda k: -max(abs(base_contrib.get(k, 0.0)), abs(new_contrib.get(k, 0.0))),
+    )
+    keys = all_keys[:8]
     labels = [SIGNAL_LABEL.get(k, k) for k in keys]
     base_vals = [base_contrib.get(k, 0.0) for k in keys]
     new_vals = [new_contrib.get(k, 0.0) for k in keys]
