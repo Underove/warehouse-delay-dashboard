@@ -71,56 +71,65 @@ warehouse-dashboard/
 
 ## 셋업 & 실행
 
+> **전제**: 프로젝트 루트(`warehouse-dashboard/`)의 부모 폴더에 `train.csv`, `test.csv`, `layout_info.csv`가 있어야 합니다.
+
 ```bash
 cd warehouse-dashboard
-python3.12 -m venv .venv
-source .venv/bin/activate
+
+# 1. 의존성 설치 (Python 3.11+ 권장, conda 환경 또는 venv)
 pip install -r requirements.txt
 
-# (옵션) 데이터 무결성 검증
-python src/data_loader.py
+# 2. 피처 캐시 생성 (최초 1회, ~30초)
+python scripts/prepare_features.py   # data/test_features.parquet
+python scripts/prepare_sequences.py  # data/test_seq.npy + models/seq_scaler.pkl
 
-# 대시보드 띄우기
+# 3. 대시보드 실행
 python src/app.py
 # → http://127.0.0.1:8050/
 ```
 
-기대 출력 (`data_loader.py`):
-- train (250000, 94), test (50000, 93)
-- layout_info 300 (train 250 / test 100 / test-only 50)
-- TARGET `avg_delay_minutes_next_30m` mean ≈ 18.96
-- SEQ_LEN 25 일관
+> **모델 파일**(`models/*.txt`, `*.cbm`, `*.pt`, `weights.json`)은 gitignore 대상입니다.  
+> 파일이 없으면 MockPredictor(더미 예측)로 자동 fallback되므로 UI 확인은 가능합니다.
+
+기대 부팅 로그:
+```
+[inference] seq models loaded  shape=(2000, 25, 173)
+[boot] layout meta cols: ['layout_type', ...]
+Dash is running on http://127.0.0.1:8050/
+```
 
 ---
 
 ## 진행 현황
 
-- [x] **Phase 0** — 폴더 구조, config, data_loader, venv, 데이터 무결성 검증
+- [x] **Phase 0** — 폴더 구조, config, data_loader, 데이터 무결성 검증
 - [x] **Phase 1** — Dash 골격: 헤더, 컨트롤, hero/gauge, 추세, 기여도, 신호 sparkline, layout 메타
 - [x] **Phase 2** — What-If Simulator: 4개 신호 슬라이더, 현재 vs 가상 비교, 기여도 변화
 - [x] **Phase 3** — 운영 패턴 진단: Radar (현재 vs train 평균) + 위험 신호 Top 3 권장 액션
 - [x] **Phase 4** — 알림 시스템: 임계 진입/회복 이벤트 감지, 추세 차트 어노테이션, KPI strip + 이벤트 pill
-- [x] **Phase 5** — 시간대 패턴: 요일×시간(7×24) heatmap, 현재 시점 마커, 시간대 평균 비교 카드
-- [x] UI 가이드: 워크플로우 5단계 strip, 위험도 범례, 섹션 번호+한 줄 안내, 한국어 라벨
-- [ ] **Phase 6** — 배포 (Render/Railway)
-- [ ] EnsemblePredictor 구현 (모델 파일 도착 시)
-- [ ] SHAP 통합 (Mock 기여도 → 실제 SHAP value)
-- [ ] 실시간 stream API (대회 종료 후, 면접 답변용)
+- [x] **Phase 5(제거)** — day_of_week × shift_hour heatmap (시나리오 내 dow 불일치 확인 후 제거)
+- [x] **Phase B** — 4-model EnsemblePredictor: LGB + CB + BiGRU + BiGRU+Attn 5-fold 앙상블
+  - 가중치 합 1.0 그대로 사용 (lgb 0.2806 / cb 0.1702 / gru 0.2940 / attn 0.2552)
+  - 시퀀스 모델은 scenario 단위 forward 후 캐시 → What-If는 tree 모델만 반응
+- [x] UI 가이드: 워크플로우 4단계 strip, 위험도 범례, 섹션 번호 안내, 한국어 라벨
+- [ ] SHAP 통합 (현재 z-score Mock 기여도 사용 중)
+- [ ] 배포 (Render/Railway)
 
 ---
 
-## 모델 파일 컨벤션 (도착 시 자동 인식)
+## 모델 파일 구조
 
 ```
 models/
-├── weights.json            # {"lgb": 0.32, "xgb": 0.24, "cb": 0.43, "gru": ...}
+├── weights.json              # 앙상블 가중치 (lgb/cb/gru/attn)
 ├── lgb_fold0.txt … fold4.txt
-├── xgb_fold0.json … fold4.json
 ├── cb_fold0.cbm  … fold4.cbm
-└── gru_fold0.pt  … fold4.pt
+├── gru_fold0.pt  … fold4.pt
+├── attn_fold0.pt … fold4.pt
+└── seq_scaler.pkl            # StandardScaler (prepare_sequences.py 생성)
 ```
 
-`load_predictor(ref_df)`가 `weights.json` 존재 여부로 `MockPredictor` ↔ `EnsemblePredictor` 자동 전환합니다.
+`load_predictor(ref_df)`가 `weights.json` + `test_features.parquet` 존재 여부로 `MockPredictor` ↔ `EnsemblePredictor` 자동 전환합니다.
 
 ---
 
